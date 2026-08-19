@@ -5,6 +5,50 @@ from __future__ import annotations
 import numpy as np
 
 
+def leiden_clusters(
+    embeddings: np.ndarray,
+    *,
+    n_neighbors: int = 20,
+    resolution: float = 0.6,
+    random_state: int = 0,
+) -> np.ndarray:
+    """Cluster one cell representation with the canonical Stage-1 Leiden setup."""
+
+    from anndata import AnnData
+    import scanpy as sc
+    from sklearn.preprocessing import normalize
+
+    values = np.asarray(embeddings, dtype=np.float32)
+    if values.ndim != 2 or values.shape[0] <= n_neighbors:
+        raise ValueError(
+            "Canonical Stage-1 Leiden requires a rank-2 matrix with more than "
+            f"{n_neighbors} cells."
+        )
+    if values.shape[1] == 0 or not np.isfinite(values).all():
+        raise ValueError("Leiden embeddings must be non-empty and finite.")
+    if n_neighbors != 20 or not np.isclose(resolution, 0.6):
+        raise ValueError(
+            "The formal Stage-1 benchmark fixes n_neighbors=20 and resolution=0.6."
+        )
+    adata = AnnData(normalize(values, norm="l2", axis=1, copy=True))
+    sc.pp.neighbors(
+        adata,
+        n_neighbors=n_neighbors,
+        use_rep="X",
+        random_state=random_state,
+    )
+    sc.tl.leiden(
+        adata,
+        resolution=resolution,
+        random_state=random_state,
+        key_added="cluster",
+        flavor="igraph",
+        directed=False,
+        n_iterations=2,
+    )
+    return adata.obs["cluster"].astype(str).to_numpy()
+
+
 def clustering_metrics(
     embeddings: np.ndarray,
     clusters: np.ndarray,

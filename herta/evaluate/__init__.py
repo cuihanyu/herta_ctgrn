@@ -1,6 +1,10 @@
 """Evaluation utilities for two-stage HERTA and regulatory validation."""
 
-from herta.evaluate.clustering import clustering_metrics
+from herta.evaluate.clustering import clustering_metrics, leiden_clusters
+from herta.evaluate.state_benchmark import (
+    STATE_BENCHMARK_COLUMNS,
+    benchmark_state_representations,
+)
 from herta.evaluate.gold import (
     GoldStandardResult,
     load_chipseq_peaks,
@@ -33,6 +37,9 @@ __all__ = [
     "DISTANCE_BINS",
     "GoldStandardResult",
     "clustering_metrics",
+    "leiden_clusters",
+    "STATE_BENCHMARK_COLUMNS",
+    "benchmark_state_representations",
     "compute_aupr_ratio",
     "compute_auprc",
     "compute_auroc",

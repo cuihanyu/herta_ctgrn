@@ -370,8 +370,22 @@ def preprocess_rna(
     _validate_anndata_matrix(adata, "RNA")
     resolved_hvg = min(int(n_top_genes), adata.n_vars)
     count_scale_hvg = hvg_flavor in {"seurat_v3", "seurat_v3_paper"}
+    hvg_retry_span: float | None = None
     if compute_highly_variable and count_scale_hvg:
-        sc.pp.highly_variable_genes(adata, n_top_genes=resolved_hvg, flavor=hvg_flavor)
+        try:
+            sc.pp.highly_variable_genes(
+                adata, n_top_genes=resolved_hvg, flavor=hvg_flavor
+            )
+        except ValueError as error:
+            if "reciprocal condition number" not in str(error):
+                raise
+            hvg_retry_span = 1.0
+            sc.pp.highly_variable_genes(
+                adata,
+                n_top_genes=resolved_hvg,
+                flavor=hvg_flavor,
+                span=hvg_retry_span,
+            )
     elif not compute_highly_variable:
         adata.var["highly_variable"] = True
     sc.pp.normalize_total(adata, target_sum=target_sum)
@@ -409,6 +423,7 @@ def preprocess_rna(
                 "requested_n_top_genes": n_top_genes,
                 "flavor": hvg_flavor,
                 "input_scale": "counts" if count_scale_hvg else "log_normalized",
+                "loess_retry_span": hvg_retry_span,
             },
             "normalize_total": {"target_sum": target_sum},
             "log1p": {"base": None},

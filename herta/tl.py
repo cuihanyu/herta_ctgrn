@@ -45,6 +45,7 @@ from herta.train.infer_stage2_lite import (
     infer_stage2_lite,
 )
 from herta.train.train_state import load_state_model, train_state
+from herta.evaluate.state_benchmark import benchmark_state_representations
 
 __all__ = [
     "build_heterodata",
@@ -77,6 +78,7 @@ __all__ = [
     "tf_gene_split_table",
     "load_state_model",
     "build_regulatory_state",
+    "benchmark_state_representations",
     "write_egrn_outputs",
     "write_regulatory_state_outputs",
     "EGRNInferenceResult",

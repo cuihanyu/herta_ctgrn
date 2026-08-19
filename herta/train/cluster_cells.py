@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from herta.train.egrn import RegulatoryStateResult
+from herta.evaluate.clustering import leiden_clusters
 
 
 def cluster_cells(
@@ -76,23 +77,12 @@ def cluster_cells(
         raise ValueError("Clustering input contains non-finite values.")
     method = str(cluster_cfg.get("method", "leiden")).lower()
     if method == "leiden":
-        import scanpy as sc
-        from anndata import AnnData
-
-        adata = AnnData(values)
-        sc.pp.neighbors(
-            adata,
-            n_neighbors=min(int(cluster_cfg.get("n_neighbors", 20)), max(2, len(values) - 1)),
-            use_rep="X",
-            random_state=int(config.get("seed", 1)),
-        )
-        sc.tl.leiden(
-            adata,
+        labels = leiden_clusters(
+            values,
+            n_neighbors=int(cluster_cfg.get("n_neighbors", 20)),
             resolution=float(cluster_cfg.get("resolution", 0.6)),
             random_state=int(config.get("seed", 1)),
-            key_added="cluster",
         )
-        labels = adata.obs["cluster"].astype(str).to_numpy()
     elif method in {"kmeans", "kmeans_auto"}:
         from sklearn.cluster import KMeans, MiniBatchKMeans
         from sklearn.metrics import silhouette_score
