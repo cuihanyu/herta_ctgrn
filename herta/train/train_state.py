@@ -378,9 +378,19 @@ def _infer_wnn_subgraph_mean(
 
 
 def _write_embeddings(embeddings: dict[str, torch.Tensor], names: dict[str, list[str]], output_dir: Path) -> None:
+    expected = {"cell", "gene", "peak"}
+    if set(embeddings) != expected or set(names) != expected:
+        raise ValueError("Stage-1 outputs require exactly cell, gene, and peak embeddings.")
     target = output_dir / "embeddings"
     target.mkdir(parents=True, exist_ok=True)
-    for node_type, values in embeddings.items():
+    for node_type in ("cell", "gene", "peak"):
+        values = embeddings[node_type]
+        if values.ndim != 2 or values.shape[0] != len(names[node_type]):
+            raise ValueError(
+                f"{node_type} embedding rows do not match the canonical identifiers."
+            )
+        if not bool(torch.isfinite(values).all()):
+            raise ValueError(f"{node_type} embeddings contain NaN or infinite values.")
         frame = pd.DataFrame(values.detach().cpu().numpy())
         frame.insert(0, "name", names[node_type])
         frame.to_parquet(target / f"{node_type}.parquet", index=False)
@@ -392,7 +402,7 @@ def train_state(
     output_dir: str | Path,
     model: StateModel | None = None,
 ) -> tuple[StateModel, pd.DataFrame, dict[str, torch.Tensor]]:
-    """Train Stage 1 on full or WNN-sampled observed graphs using graph loss only.
+    """Train the fixed Stage-1 baseline and run one full-graph inference pass.
 
     ``model`` may be supplied by tutorial or experiment code that needs to
     inspect the exact initialized instance before training.  Omitting it keeps
@@ -403,6 +413,11 @@ def train_state(
     set_seed(int(config.get("seed", 1)))
     model_cfg = config.get("state_model", config.get("model", {}))
     train_cfg = config.get("state_training", config.get("training", {}))
+    final_inference_mode = str(train_cfg.get("final_inference_mode", "full_graph"))
+    if final_inference_mode != "full_graph":
+        raise ValueError(
+            "The formal Stage-1 baseline requires final_inference_mode='full_graph'."
+        )
     device = _inference_device(train_cfg.get("device", "cpu"))
     loss_mapping = dict(train_cfg)
     loss_mapping.update(train_cfg.get("losses", {}))
@@ -834,44 +849,26 @@ def train_state(
         raise RuntimeError("Stage-1 training produced no checkpoint.")
     model.load_state_dict(best_state)
     model.eval()
-    final_inference_mode = str(
-        train_cfg.get(
-            "final_inference_mode",
-            "wnn_subgraph_mean" if subgraph_sampler is not None else "full_graph",
+    with torch.no_grad():
+        inference_data = (
+            build.data if device.type == "cpu" else build.data.clone().to(device)
         )
-    )
-    if final_inference_mode == "wnn_subgraph_mean":
-        if subgraph_sampler is None:
-            raise ValueError("wnn_subgraph_mean requires sampling_strategy='wnn_subgraph'.")
-        embeddings, inference_diagnostics = _infer_wnn_subgraph_mean(
-            model,
-            build,
-            subgraph_sampler,
-            seed_batch_size=int(
-                train_cfg.get("inference_seed_cells", subgraph_seed_cells)
-            ),
-            device=device,
-        )
-    elif final_inference_mode == "full_graph":
-        with torch.no_grad():
-            inference_data = (
-                build.data if device.type == "cpu" else build.data.clone().to(device)
-            )
-            embeddings = {
-                name: value.detach().cpu()
-                for name, value in model.encode(
-                    inference_data,
-                    {name: value.to(device) for name, value in build.features.items()},
-                ).items()
-            }
-        inference_diagnostics = {
-            "final_inference_mode": "full_graph",
-            "final_inference_batches": 1.0,
+        embeddings = {
+            name: value.detach().cpu()
+            for name, value in model.encode(
+                inference_data,
+                {name: value.to(device) for name, value in build.features.items()},
+            ).items()
         }
-    else:
-        raise ValueError(
-            "final_inference_mode must be 'full_graph' or 'wnn_subgraph_mean'."
-        )
+    inference_diagnostics = {
+        "final_inference_mode": "full_graph",
+        "final_inference_batches": 1.0,
+        "best_global_step": float(best_global_step),
+        **{
+            f"{node_type}_embedding_rows": float(values.shape[0])
+            for node_type, values in embeddings.items()
+        },
+    }
     metrics = pd.DataFrame(rows)
     (output_dir / "logs").mkdir(parents=True, exist_ok=True)
     metrics.to_csv(output_dir / "logs" / "stage1_metrics.csv", index=False)
@@ -901,6 +898,7 @@ def train_state(
         names=build.names,
         features={name: value.cpu() for name, value in build.features.items()},
         embeddings={name: value.cpu() for name, value in embeddings.items()},
+        inference_diagnostics=inference_diagnostics,
         cell_types=build.metadata.get("cell_types"),
     )
     return model, metrics, embeddings
