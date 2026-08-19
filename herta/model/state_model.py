@@ -23,28 +23,20 @@ class StateModel(nn.Module):
         num_heads: int = 2,
         dropout: float = 0.1,
         use_id_residual: bool = False,
-        atac_feature_dim: int = 0,
-        modality_fusion: str = "joint",
-        atac_gate_init: float = 0.25,
     ) -> None:
         super().__init__()
-        if modality_fusion not in {"joint", "gated"}:
-            raise ValueError("modality_fusion must be 'joint' or 'gated'.")
         input_dims = {name: int(value.shape[1]) for name, value in features.items()}
         num_nodes = {name: int(data[name].num_nodes) for name in data.node_types}
-        cell_modality_dims = None
-        if modality_fusion == "gated":
-            rna_feature_dim = input_dims["cell"] - atac_feature_dim
-            if rna_feature_dim < 1 or atac_feature_dim < 1:
-                raise ValueError("Gated fusion requires positive RNA and ATAC cell feature dimensions.")
-            cell_modality_dims = (rna_feature_dim, atac_feature_dim)
+        for name, values in features.items():
+            if values.ndim != 2 or values.shape[0] != num_nodes[name]:
+                raise ValueError(f"{name} features must align with graph nodes.")
+            if not torch.isfinite(values).all():
+                raise ValueError(f"{name} features contain NaN or infinite values.")
         self.initializer = DataDrivenNodeInitializer(
             input_dims,
             hidden_dim,
             num_nodes,
             use_id_residual,
-            cell_modality_dims=cell_modality_dims,
-            atac_gate_init=atac_gate_init,
         )
         self.encoder = HGTEncoder(hidden_dim, num_layers, num_heads, data.metadata(), dropout)
         self.decoders = ProjectedRelationDecoders(hidden_dim, ["cg", "cp"])
@@ -54,9 +46,14 @@ class StateModel(nn.Module):
             "num_heads": num_heads,
             "dropout": dropout,
             "use_id_residual": use_id_residual,
-            "atac_feature_dim": atac_feature_dim,
-            "modality_fusion": modality_fusion,
-            "atac_gate_init": atac_gate_init,
+        }
+        self.initialization_audit = {
+            "cell_concatenated_shape": list(features["cell"].shape),
+            "gene_feature_shape": list(features["gene"].shape),
+            "peak_feature_shape": list(features["peak"].shape),
+            "projected_hidden_dimension": int(hidden_dim),
+            "all_features_finite": True,
+            "fusion": "rna_pca_concat_atac_lsi",
         }
 
     def encode(

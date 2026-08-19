@@ -404,6 +404,11 @@ def train_state(
     loss_mapping = dict(train_cfg)
     loss_mapping.update(train_cfg.get("losses", {}))
     loss_config = Stage1LossConfig.from_mapping(loss_mapping)
+    modality_fusion = str(model_cfg.get("modality_fusion", "joint"))
+    if modality_fusion not in {"joint", "concat"}:
+        raise ValueError(
+            "The formal Stage-1 baseline fixes modality_fusion='joint' (concat)."
+        )
     if model is None:
         model = StateModel(
             build.data,
@@ -413,9 +418,6 @@ def train_state(
             num_heads=int(model_cfg.get("num_heads", 2)),
             dropout=float(model_cfg.get("dropout", 0.1)),
             use_id_residual=bool(model_cfg.get("use_id_residual", False)),
-            atac_feature_dim=int(build.factors.atac_cell_scores.shape[1]),
-            modality_fusion=str(model_cfg.get("modality_fusion", "joint")),
-            atac_gate_init=float(model_cfg.get("atac_gate_init", 0.25)),
         )
     model = model.to(device)
     optimizer = torch.optim.AdamW(
@@ -782,8 +784,6 @@ def train_state(
                     "active_weight_lambda_wnn": loss_config.lambda_wnn,
                 }
             )
-            if model.initializer.atac_gate is not None:
-                row["atac_gate"] = float(model.initializer.atac_gate.detach())
 
             should_validate = bool(validation) and (
                 global_step % validation_interval == 0

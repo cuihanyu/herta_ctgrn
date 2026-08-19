@@ -291,6 +291,11 @@ def build_state_graph(
             ),
             "rna_factor_dim": int(factors.rna_cell_scores.shape[1]),
             "atac_factor_dim": int(factors.atac_cell_scores.shape[1]),
+            "rna_cell_feature_shape": list(factors.rna_cell_scores.shape),
+            "atac_cell_feature_shape": list(factors.atac_cell_scores.shape),
+            "cell_concatenated_shape": list(features["cell"].shape),
+            "gene_feature_shape": list(features["gene"].shape),
+            "peak_feature_shape": list(features["peak"].shape),
             **relation_diagnostics,
         }
     )
