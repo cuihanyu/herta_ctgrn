@@ -94,7 +94,7 @@ def cluster_cells(
         )
         labels = adata.obs["cluster"].astype(str).to_numpy()
     elif method in {"kmeans", "kmeans_auto"}:
-        from sklearn.cluster import MiniBatchKMeans
+        from sklearn.cluster import KMeans, MiniBatchKMeans
         from sklearn.metrics import silhouette_score
 
         seed = int(config.get("seed", 1))
@@ -133,11 +133,10 @@ def cluster_cells(
             labels = selected.astype(str)
         else:
             n_clusters = int(cluster_cfg.get("n_clusters", 2))
-            labels = MiniBatchKMeans(
+            labels = KMeans(
                 n_clusters=n_clusters,
                 random_state=seed,
-                n_init=10,
-                batch_size=min(1024, len(values)),
+                n_init=int(cluster_cfg.get("n_init", 50)),
             ).fit_predict(values).astype(str)
     else:
         raise ValueError(

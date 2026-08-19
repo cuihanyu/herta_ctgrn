@@ -40,6 +40,72 @@ def weighted_infonce_loss(
     return -(edge_weight * log_prob).sum() / edge_weight.sum().clamp_min(1e-8)
 
 
+def wnn_neighborhood_infonce_loss(
+    cell_embeddings: torch.Tensor,
+    anchor_ids: torch.Tensor,
+    neighbor_ids: torch.Tensor,
+    neighbor_weights: torch.Tensor,
+    *,
+    num_negatives: int = 5,
+    temperature: float = 0.2,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Contrast WNN neighbors against fixed-count non-neighbor cells."""
+
+    if cell_embeddings.ndim != 2 or cell_embeddings.shape[0] < 2:
+        raise ValueError("cell_embeddings must have shape [n_cells, dim].")
+    if anchor_ids.ndim != 1 or neighbor_ids.ndim != 2:
+        raise ValueError("anchor_ids and neighbor_ids must be 1D and 2D tensors.")
+    if neighbor_ids.shape != neighbor_weights.shape or neighbor_ids.shape[0] != len(anchor_ids):
+        raise ValueError("WNN neighbors and weights must align with anchor_ids.")
+    if num_negatives < 1 or temperature <= 0:
+        raise ValueError("num_negatives and temperature must be positive.")
+    if not bool(torch.isfinite(cell_embeddings).all() and torch.isfinite(neighbor_weights).all()):
+        raise ValueError("WNN loss inputs must contain finite values.")
+    if bool((neighbor_weights < 0).any()) or float(neighbor_weights.sum()) <= 0:
+        raise ValueError("WNN neighbor weights must be non-negative with positive sum.")
+    n_cells = int(cell_embeddings.shape[0])
+    if bool((anchor_ids < 0).any()) or bool((anchor_ids >= n_cells).any()):
+        raise IndexError("WNN anchor IDs are out of range.")
+    if bool((neighbor_ids < 0).any()) or bool((neighbor_ids >= n_cells).any()):
+        raise IndexError("WNN neighbor IDs are out of range.")
+    negatives = torch.empty(
+        (*neighbor_ids.shape, num_negatives), dtype=torch.long
+    )
+    for row, anchor in enumerate(anchor_ids.tolist()):
+        forbidden = torch.unique(
+            torch.cat([anchor_ids.new_tensor([anchor]), neighbor_ids[row]])
+        )
+        if len(forbidden) >= n_cells:
+            raise ValueError("A WNN anchor has no eligible negative cells.")
+        candidates = torch.randint(
+            n_cells,
+            (neighbor_ids.shape[1], num_negatives),
+            generator=generator,
+        )
+        invalid = torch.isin(candidates, forbidden)
+        while bool(invalid.any()):
+            candidates[invalid] = torch.randint(
+                n_cells, (int(invalid.sum()),), generator=generator
+            )
+            invalid = torch.isin(candidates, forbidden)
+        negatives[row] = candidates
+    unit = F.normalize(cell_embeddings, dim=1)
+    anchor_device = anchor_ids.to(cell_embeddings.device)
+    neighbor_device = neighbor_ids.to(cell_embeddings.device)
+    anchors = unit[anchor_device][:, None, :].expand(-1, neighbor_ids.shape[1], -1)
+    positive_logits = (anchors * unit[neighbor_device]).sum(dim=-1).reshape(-1)
+    negative_logits = (
+        anchors[:, :, None, :] * unit[negatives.to(cell_embeddings.device)]
+    ).sum(dim=-1).reshape(-1, num_negatives)
+    return weighted_infonce_loss(
+        positive_logits,
+        negative_logits,
+        neighbor_weights.to(cell_embeddings.device).reshape(-1),
+        temperature,
+    )
+
+
 def link_prediction_bce_loss(
     pos_logits: torch.Tensor,
     neg_logits: torch.Tensor,
@@ -356,6 +422,30 @@ class Stage1LossConfig:
             lambda_anchor=0.0,
         )
     )
+    lambda_cg: float = 0.6
+    lambda_cp: float = 0.4
+    lambda_wnn: float = 0.0
+    normalize_relation_weights: bool = True
+
+    def __post_init__(self) -> None:
+        lambda_cg = float(self.lambda_cg)
+        lambda_cp = float(self.lambda_cp)
+        if not np.isfinite(lambda_cg) or not np.isfinite(lambda_cp):
+            raise ValueError("lambda_cg and lambda_cp must be finite.")
+        if lambda_cg < 0 or lambda_cp < 0 or lambda_cg + lambda_cp <= 0:
+            raise ValueError(
+                "lambda_cg and lambda_cp must be non-negative with a positive sum."
+            )
+        if self.normalize_relation_weights:
+            total = lambda_cg + lambda_cp
+            lambda_cg /= total
+            lambda_cp /= total
+        object.__setattr__(self, "lambda_cg", lambda_cg)
+        object.__setattr__(self, "lambda_cp", lambda_cp)
+        lambda_wnn = float(self.lambda_wnn)
+        if not np.isfinite(lambda_wnn) or lambda_wnn < 0:
+            raise ValueError("lambda_wnn must be finite and non-negative.")
+        object.__setattr__(self, "lambda_wnn", lambda_wnn)
     @classmethod
     def from_mapping(cls, config: Mapping[str, object]) -> "Stage1LossConfig":
         legacy_keys = {
@@ -377,6 +467,7 @@ class Stage1LossConfig:
                 key: float(value)
                 for key, value in config.items()
                 if str(key).startswith("lambda_")
+                and key not in {"lambda_cg", "lambda_cp", "lambda_wnn"}
             },
             defaults=defaults.weights,
         )
@@ -390,9 +481,18 @@ class Stage1LossConfig:
                 "Stage 1 supports only lambda_graph; disable auxiliary weights: "
                 f"{sorted(active_auxiliaries)}."
             )
-        if weights.lambda_graph != 1.0:
-            raise ValueError("Stage 1 fixes lambda_graph=1.0 because L_Stage1=L_graph.")
-        return cls(weights=weights)
+        return cls(
+            weights=weights,
+            lambda_cg=float(config.get("lambda_cg", defaults.lambda_cg)),
+            lambda_cp=float(config.get("lambda_cp", defaults.lambda_cp)),
+            lambda_wnn=float(config.get("lambda_wnn", defaults.lambda_wnn)),
+            normalize_relation_weights=bool(
+                config.get(
+                    "normalize_relation_weights",
+                    defaults.normalize_relation_weights,
+                )
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -604,10 +704,32 @@ class MultiTaskLossManager(nn.Module):
 def stage1_objective(
     cg_loss: torch.Tensor,
     cp_loss: torch.Tensor,
+    lambda_graph: float = 1.0,
+    lambda_cg: float = 0.6,
+    lambda_cp: float = 0.4,
+    wnn_loss: torch.Tensor | None = None,
+    lambda_wnn: float = 0.0,
+    normalize_relation_weights: bool = True,
 ) -> torch.Tensor:
-    """Return the balanced observed-graph Stage-1 objective."""
+    """Return the configured observed-graph Stage-1 objective."""
 
-    return 0.5 * (cg_loss + cp_loss)
+    config = Stage1LossConfig.from_mapping(
+        {
+            "lambda_graph": lambda_graph,
+            "lambda_cg": lambda_cg,
+            "lambda_cp": lambda_cp,
+            "lambda_wnn": lambda_wnn,
+            "normalize_relation_weights": normalize_relation_weights,
+        }
+    )
+    graph = config.weights.lambda_graph * (
+        config.lambda_cg * cg_loss + config.lambda_cp * cp_loss
+    )
+    if config.lambda_wnn == 0:
+        return graph
+    if wnn_loss is None:
+        raise ValueError("wnn_loss is required when lambda_wnn is positive.")
+    return graph + config.lambda_wnn * wnn_loss
 
 
 def stage2_objective(

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import logging
 from pathlib import Path
 from typing import Mapping
 
@@ -14,7 +16,9 @@ from herta.data.sampling import CellKNNSampler, SamplerConfig, SubgraphBatch
 from herta.data.state_graph import STATE_RELATIONS, StateGraphBuildResult
 from herta.model.losses import (
     Stage1LossConfig,
+    stage1_objective,
     weighted_infonce_loss,
+    wnn_neighborhood_infonce_loss,
 )
 from herta.model.state_model import StateModel
 from herta.utils.checkpoint import save_checkpoint
@@ -26,6 +30,211 @@ STATE_REL_CFG = {
     "cg": ("cell", "gene", "negative_ratio_cg", "temperature_cg"),
     "cp": ("cell", "peak", "negative_ratio_cp", "temperature_cp"),
 }
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _split_fixed_validation_edges(
+    data,
+    *,
+    validation_fraction: float,
+    validation_cells: int,
+    max_edges_per_cell: int,
+    generator: torch.Generator,
+) -> tuple[object, dict[str, dict[str, torch.Tensor]]]:
+    """Hold out deterministic observed edges while retaining train degree per cell."""
+
+    if not 0 <= validation_fraction < 1:
+        raise ValueError("validation_fraction must be in [0, 1).")
+    if validation_cells < 1 or max_edges_per_cell < 1:
+        raise ValueError(
+            "validation_cells and validation_positive_edges_per_cell must be positive."
+        )
+    training_data = data.clone()
+    if validation_fraction == 0:
+        return training_data, {}
+    n_cells = int(data["cell"].num_nodes)
+    selected_sources = torch.randperm(n_cells, generator=generator)[
+        : min(validation_cells, n_cells)
+    ]
+    validation: dict[str, dict[str, torch.Tensor]] = {}
+    for relation, edge_type in STATE_RELATIONS.items():
+        edge_index = data[edge_type].edge_index
+        edge_weight = data[edge_type].edge_weight
+        sources = edge_index[0]
+        counts = torch.bincount(sources, minlength=n_cells)
+        starts = torch.cumsum(counts, dim=0) - counts
+        held_out: list[torch.Tensor] = []
+        for source in selected_sources.tolist():
+            degree = int(counts[source])
+            if degree < 2:
+                continue
+            requested = max(1, int(round(degree * validation_fraction)))
+            count = min(requested, max_edges_per_cell, degree - 1)
+            local = torch.randperm(degree, generator=generator)[:count]
+            held_out.append(starts[source] + local)
+        if not held_out:
+            continue
+        validation_ids = torch.sort(torch.cat(held_out)).values
+        train_mask = torch.ones(edge_index.shape[1], dtype=torch.bool)
+        train_mask[validation_ids] = False
+        training_data[edge_type].edge_index = edge_index[:, train_mask]
+        for key, value in data[edge_type].items():
+            if key == "edge_index":
+                continue
+            if isinstance(value, torch.Tensor) and value.ndim >= 1 and value.shape[0] == edge_index.shape[1]:
+                training_data[edge_type][key] = value[train_mask]
+        reverse = (edge_type[2], f"rev_{edge_type[1]}", edge_type[0])
+        if reverse in training_data.edge_types:
+            training_data[reverse].edge_index = edge_index[:, train_mask].flip(0)
+            for key, value in data[reverse].items():
+                if key == "edge_index":
+                    continue
+                if isinstance(value, torch.Tensor) and value.ndim >= 1 and value.shape[0] == edge_index.shape[1]:
+                    training_data[reverse][key] = value[train_mask]
+        validation[relation] = {
+            "positive": edge_index[:, validation_ids],
+            "weight": edge_weight[validation_ids],
+            "full_positive": edge_index,
+        }
+    return training_data, validation
+
+
+def _map_global_edges_to_local_if_present(
+    edge_index: torch.Tensor,
+    global_node_ids: Mapping[str, torch.Tensor],
+    source_type: str,
+    target_type: str,
+) -> torch.Tensor:
+    """Map global edges whose endpoints occur in a sampled batch to local IDs."""
+
+    source_ids = global_node_ids[source_type]
+    target_ids = global_node_ids[target_type]
+    source_local = torch.searchsorted(source_ids, edge_index[0])
+    target_local = torch.searchsorted(target_ids, edge_index[1])
+    source_ok = source_local < len(source_ids)
+    target_ok = target_local < len(target_ids)
+    source_match = torch.zeros_like(source_ok)
+    target_match = torch.zeros_like(target_ok)
+    source_match[source_ok] = source_ids[source_local[source_ok]] == edge_index[0, source_ok]
+    target_match[target_ok] = target_ids[target_local[target_ok]] == edge_index[1, target_ok]
+    keep = source_match & target_match
+    return torch.stack([source_local[keep], target_local[keep]])
+
+
+def _fixed_validation_payload(
+    validation: dict[str, dict[str, torch.Tensor]],
+    data,
+    train_cfg: Mapping[str, object],
+    generator: torch.Generator,
+) -> dict[str, dict[str, torch.Tensor]]:
+    """Attach one deterministic negative matrix to every held-out relation."""
+
+    payload: dict[str, dict[str, torch.Tensor]] = {}
+    for relation, values in validation.items():
+        _, dst_type, neg_key, _ = STATE_REL_CFG[relation]
+        positive = values["positive"]
+        payload[relation] = dict(values)
+        payload[relation]["negative"] = sample_negative_targets(
+            positive,
+            int(data[dst_type].num_nodes),
+            int(train_cfg.get(neg_key, 5)),
+            generator,
+            all_positive_edge_index=values["full_positive"],
+        )
+    return payload
+
+
+def _evaluate_fixed_validation(
+    model: StateModel,
+    build: StateGraphBuildResult,
+    training_data,
+    validation: dict[str, dict[str, torch.Tensor]],
+    loss_config: Stage1LossConfig,
+    train_cfg: Mapping[str, object],
+    device: torch.device,
+    subgraph_sampler: CellKNNSampler | None,
+) -> dict[str, float]:
+    """Evaluate fixed held-out positives and negatives without resampling."""
+
+    if set(validation) != set(STATE_RELATIONS):
+        raise ValueError("Fixed validation requires held-out CG and CP edges.")
+    model.eval()
+    with torch.no_grad():
+        if subgraph_sampler is None:
+            encoded_data = (
+                training_data
+                if device.type == "cpu"
+                else training_data.clone().to(device)
+            )
+            embeddings = model.encode(
+                encoded_data,
+                {name: value.to(device) for name, value in build.features.items()},
+            )
+        else:
+            validation_sources = torch.unique(
+                torch.cat(
+                    [values["positive"][0] for values in validation.values()]
+                ),
+                sorted=True,
+            )
+            batch = subgraph_sampler.sample(validation_sources)
+            local_data = (
+                batch.data if device.type == "cpu" else batch.data.clone().to(device)
+            )
+            local_embeddings = model.encode(
+                local_data,
+                {
+                    name: value.to(device)
+                    for name, value in _subgraph_features(build, batch).items()
+                },
+                global_node_ids=dict(batch.global_node_ids),
+            )
+            embeddings = model.initializer(
+                {name: value.to(device) for name, value in build.features.items()}
+            )
+            embeddings = {name: value.clone() for name, value in embeddings.items()}
+            for node_type, values in local_embeddings.items():
+                embeddings[node_type].index_copy_(
+                    0,
+                    batch.global_node_ids[node_type].to(device),
+                    values,
+                )
+        losses: dict[str, torch.Tensor] = {}
+        for relation, values in validation.items():
+            src_type, dst_type, _, temp_key = STATE_REL_CFG[relation]
+            positive = values["positive"].to(device)
+            negative = values["negative"].to(device)
+            pos_logits = model.decoders.score(
+                relation, embeddings[src_type], embeddings[dst_type], positive
+            )
+            src_ids = positive[0].repeat_interleave(negative.shape[1])
+            neg_logits = model.decoders.score_pairs(
+                relation,
+                embeddings[src_type],
+                embeddings[dst_type],
+                src_ids,
+                negative.reshape(-1),
+            ).reshape(positive.shape[1], -1)
+            losses[relation] = weighted_infonce_loss(
+                pos_logits,
+                neg_logits,
+                values["weight"].to(device),
+                float(train_cfg.get(temp_key, 0.2)),
+            )
+        total = stage1_objective(
+            losses["cg"],
+            losses["cp"],
+            lambda_graph=loss_config.weights.lambda_graph,
+            lambda_cg=loss_config.lambda_cg,
+            lambda_cp=loss_config.lambda_cp,
+            normalize_relation_weights=False,
+        )
+    return {
+        "validation_loss_cg": float(losses["cg"]),
+        "validation_loss_cp": float(losses["cp"]),
+        "validation_loss": float(total),
+    }
 
 
 def _edge_checksum(edge_index: torch.Tensor) -> int:
@@ -157,7 +366,7 @@ def _infer_wnn_subgraph_mean(
         )
     for relation, edge_type in STATE_RELATIONS.items():
         target_type = edge_type[2]
-        observed_targets = torch.unique(build.data[edge_type].edge_index[1])
+        observed_targets = torch.unique(sampler.data[edge_type].edge_index[1])
         if bool((counts[target_type][observed_targets] == 0).any()):
             raise RuntimeError(
                 f"WNN inference left observed {relation} target nodes unvisited."
@@ -194,7 +403,7 @@ def train_state(
     device = _inference_device(train_cfg.get("device", "cpu"))
     loss_mapping = dict(train_cfg)
     loss_mapping.update(train_cfg.get("losses", {}))
-    Stage1LossConfig.from_mapping(loss_mapping)
+    loss_config = Stage1LossConfig.from_mapping(loss_mapping)
     if model is None:
         model = StateModel(
             build.data,
@@ -233,21 +442,72 @@ def train_state(
             "state_training.sampling_strategy must be 'edge_uniform', "
             "'cell_balanced', or 'wnn_subgraph'."
         )
+    if loss_config.lambda_wnn > 0 and sampling_strategy != "wnn_subgraph":
+        raise ValueError(
+            "A positive lambda_wnn requires sampling_strategy='wnn_subgraph'."
+        )
     checkpoint_selection = str(
         train_cfg.get(
             "checkpoint_selection",
-            "last" if sampling_strategy in {"cell_balanced", "wnn_subgraph"} else "loss",
+            "validation",
         )
     )
-    if checkpoint_selection not in {"last", "loss"}:
-        raise ValueError("state_training.checkpoint_selection must be 'last' or 'loss'.")
+    if checkpoint_selection not in {"validation", "last", "loss"}:
+        raise ValueError(
+            "state_training.checkpoint_selection must be 'validation', 'last', or 'loss'."
+        )
+    epochs = int(train_cfg.get("epochs", 100))
+    # Omitted values retain the historical one-update epoch; maintained configs
+    # now set this explicitly to 10 so existing callers are not silently expanded.
+    steps_per_epoch = int(train_cfg.get("steps_per_epoch", 1))
+    max_steps = int(train_cfg.get("max_steps", 1000))
+    if epochs < 1 or steps_per_epoch < 1 or max_steps < 1:
+        raise ValueError("epochs, steps_per_epoch, and max_steps must be positive.")
+    total_planned_steps = min(epochs * steps_per_epoch, max_steps)
+    validation_interval = int(train_cfg.get("validation_interval_steps", 50))
+    early_stopping_patience = int(train_cfg.get("early_stopping_patience", 10))
+    if validation_interval < 1 or early_stopping_patience < 1:
+        raise ValueError(
+            "validation_interval_steps and early_stopping_patience must be positive."
+        )
+    validation_generator = torch.Generator().manual_seed(base_seed + 4_001)
+    training_graph, validation = _split_fixed_validation_edges(
+        build.data,
+        validation_fraction=float(train_cfg.get("validation_fraction", 0.05)),
+        validation_cells=int(train_cfg.get("validation_cells", 64)),
+        max_edges_per_cell=int(
+            train_cfg.get("validation_positive_edges_per_cell", 4)
+        ),
+        generator=validation_generator,
+    )
+    validation = _fixed_validation_payload(
+        validation,
+        build.data,
+        train_cfg,
+        validation_generator,
+    )
+    if checkpoint_selection == "validation" and set(validation) != set(STATE_RELATIONS):
+        raise ValueError(
+            "checkpoint_selection='validation' requires non-empty fixed CG and CP "
+            "validation edges; increase validation_cells or validation_fraction."
+        )
+    if validation:
+        LOGGER.info(
+            "Stage1 fixed validation: cg_positive=%d cp_positive=%d "
+            "cg_negatives_per_positive=%d cp_negatives_per_positive=%d",
+            validation["cg"]["positive"].shape[1] if "cg" in validation else 0,
+            validation["cp"]["positive"].shape[1] if "cp" in validation else 0,
+            validation["cg"]["negative"].shape[1] if "cg" in validation else 0,
+            validation["cp"]["negative"].shape[1] if "cp" in validation else 0,
+        )
     batch_size = int(train_cfg.get("batch_size_edges_per_relation", 256))
     batch_size_cells = int(train_cfg.get("batch_size_cells", 1024))
     subgraph_sampler: CellKNNSampler | None = None
     subgraph_generator = torch.Generator().manual_seed(base_seed + 3_001)
+    wnn_generator = torch.Generator().manual_seed(base_seed + 5_001)
     subgraph_seed_cells = int(train_cfg.get("subgraph_seed_cells", 128))
     if sampling_strategy == "wnn_subgraph":
-        n_cells = int(build.data["cell"].num_nodes)
+        n_cells = int(training_graph["cell"].num_nodes)
         subgraph_neighbors = int(train_cfg.get("subgraph_neighbors", 20))
         subgraph_candidates = int(train_cfg.get("subgraph_candidate_neighbors", 100))
         if not 1 <= subgraph_seed_cells <= n_cells:
@@ -259,7 +519,7 @@ def train_state(
                 "state_training.subgraph_neighbors must be between 1 and n_cells - 1."
             )
         subgraph_sampler = CellKNNSampler(
-            build.data,
+            training_graph,
             SamplerConfig(
                 seed=base_seed,
                 n_neighbors=subgraph_neighbors,
@@ -281,168 +541,314 @@ def train_state(
     rows: list[dict[str, float | str]] = []
     best_loss = float("inf")
     best_state: dict[str, torch.Tensor] | None = None
-    for epoch in range(1, int(train_cfg.get("epochs", 100)) + 1):
-        if rng_mode == "ablation_fixed":
-            _seed_torch_dropout(base_seed + 10_000 + epoch)
-        model.train()
-        optimizer.zero_grad()
-        row: dict[str, float | str] = {
-            "epoch": float(epoch),
-            "rng_mode": rng_mode,
-            "sampling_strategy": sampling_strategy,
-        }
-        training_data = build.data
-        training_features = build.features
-        global_node_ids: Mapping[str, torch.Tensor] | None = None
-        if subgraph_sampler is not None:
-            seed_ids = torch.randperm(
-                int(build.data["cell"].num_nodes), generator=subgraph_generator
-            )[:subgraph_seed_cells]
-            sampled_seed_cells.update(map(int, seed_ids.tolist()))
-            batch = subgraph_sampler.sample(seed_ids)
-            training_data = batch.data
-            training_features = _subgraph_features(build, batch)
-            global_node_ids = batch.global_node_ids
+    best_optimizer_state: dict | None = None
+    best_global_step = 0
+    validation_count = 0
+    validations_without_improvement = 0
+    global_step = 0
+    stop_training = False
+    log_interval = int(train_cfg.get("log_interval_steps", 25))
+    grad_clip_norm = float(train_cfg.get("grad_clip_norm", 1.0))
+    if log_interval < 1 or grad_clip_norm <= 0:
+        raise ValueError("log_interval_steps and grad_clip_norm must be positive.")
+    for epoch in range(1, epochs + 1):
+        for step_in_epoch in range(1, steps_per_epoch + 1):
+            if global_step >= max_steps:
+                stop_training = True
+                break
+            global_step += 1
+            if rng_mode == "ablation_fixed":
+                _seed_torch_dropout(base_seed + 10_000 + global_step)
+            model.train()
+            optimizer.zero_grad()
+            row: dict[str, float | str] = {
+                "epoch": float(epoch),
+                "step_in_epoch": float(step_in_epoch),
+                "global_step": float(global_step),
+                "rng_mode": rng_mode,
+                "sampling_strategy": sampling_strategy,
+            }
+            training_data = training_graph
+            training_features = build.features
+            global_node_ids: Mapping[str, torch.Tensor] | None = None
+            if subgraph_sampler is not None:
+                seed_ids = torch.randperm(
+                    int(training_graph["cell"].num_nodes),
+                    generator=subgraph_generator,
+                )[:subgraph_seed_cells]
+                sampled_seed_cells.update(map(int, seed_ids.tolist()))
+                batch = subgraph_sampler.sample(seed_ids)
+                training_data = batch.data
+                training_features = _subgraph_features(build, batch)
+                global_node_ids = batch.global_node_ids
+                row.update(
+                    {
+                        "subgraph_seed_cells": float(seed_ids.numel()),
+                        "subgraph_seed_checksum": float(
+                            _edge_checksum(torch.stack([seed_ids, seed_ids]))
+                        ),
+                        "subgraph_seed_cell_coverage": len(sampled_seed_cells)
+                        / float(build.data["cell"].num_nodes),
+                        "subgraph_context_cells": float(
+                            batch.diagnostics["context_cell_count"]
+                        ),
+                        "subgraph_cell_fraction": float(
+                            batch.data["cell"].num_nodes
+                        )
+                        / float(build.data["cell"].num_nodes),
+                    }
+                )
+                for node_type in ("cell", "gene", "peak"):
+                    row[f"subgraph_{node_type}_nodes"] = float(
+                        batch.data[node_type].num_nodes
+                    )
+                for relation, edge_type in STATE_RELATIONS.items():
+                    reverse = (edge_type[2], f"rev_{edge_type[1]}", edge_type[0])
+                    row[f"subgraph_{relation}_edges"] = float(
+                        batch.data[edge_type].edge_index.shape[1]
+                    )
+                    row[f"subgraph_rev_{relation}_edges"] = float(
+                        batch.data[reverse].edge_index.shape[1]
+                    )
+            encoded_data = (
+                training_data
+                if device.type == "cpu"
+                else training_data.clone().to(device)
+            )
+            encoded_features = {
+                name: value.to(device) for name, value in training_features.items()
+            }
+            embeddings = model.encode(
+                encoded_data,
+                encoded_features,
+                global_node_ids=(
+                    None if global_node_ids is None else dict(global_node_ids)
+                ),
+            )
+            relation_losses: dict[str, torch.Tensor] = {}
+            for relation, edge_type in STATE_RELATIONS.items():
+                src_type, dst_type, neg_key, temp_key = STATE_REL_CFG[relation]
+                relation_generator = relation_generators[relation]
+                if sampling_strategy in {"cell_balanced", "wnn_subgraph"}:
+                    edges_per_cell = int(
+                        train_cfg.get(
+                            f"positive_edges_per_cell_{relation}",
+                            train_cfg.get("positive_edges_per_cell", 4),
+                        )
+                    )
+                    positive, weights = sample_positive_edges_by_source(
+                        training_data,
+                        edge_type,
+                        batch_size_cells,
+                        edges_per_cell,
+                        relation_generator,
+                    )
+                else:
+                    positive, weights = sample_positive_edges(
+                        training_data, edge_type, batch_size, relation_generator
+                    )
+                global_positive = _global_edge_index(
+                    positive, src_type, dst_type, global_node_ids
+                )
+                current_sources = set(map(int, global_positive[0].unique().tolist()))
+                sampled_sources[relation].update(current_sources)
+                row[f"{relation}_sampled_edges"] = float(positive.shape[1])
+                row[f"{relation}_sampled_cells"] = float(len(current_sources))
+                row[f"{relation}_cell_coverage"] = len(sampled_sources[relation]) / float(
+                    build.data["cell"].num_nodes
+                )
+                all_local_positive = training_data[edge_type].edge_index
+                if relation in validation:
+                    if global_node_ids is None:
+                        all_local_positive = validation[relation]["full_positive"]
+                    else:
+                        mapped_validation = _map_global_edges_to_local_if_present(
+                            validation[relation]["positive"],
+                            global_node_ids,
+                            src_type,
+                            dst_type,
+                        )
+                        all_local_positive = torch.cat(
+                            [all_local_positive, mapped_validation], dim=1
+                        )
+                negatives = sample_negative_targets(
+                    positive,
+                    int(training_data[dst_type].num_nodes),
+                    int(train_cfg.get(neg_key, 5)),
+                    relation_generator,
+                    all_positive_edge_index=all_local_positive,
+                )
+                row[f"{relation}_negative_count"] = float(negatives.shape[1])
+                row[f"{relation}_positive_checksum"] = float(
+                    _edge_checksum(global_positive)
+                )
+                negative_edges = torch.stack(
+                    [
+                        positive[0].repeat_interleave(negatives.shape[1]),
+                        negatives.reshape(-1),
+                    ]
+                )
+                global_negative = _global_edge_index(
+                    negative_edges, src_type, dst_type, global_node_ids
+                )
+                row[f"{relation}_negative_checksum"] = float(
+                    _edge_checksum(global_negative)
+                )
+                positive_device = positive.to(device)
+                negatives_device = negatives.to(device)
+                pos_logits = model.decoders.score(
+                    relation,
+                    embeddings[src_type],
+                    embeddings[dst_type],
+                    positive_device,
+                )
+                src_ids = positive_device[0].repeat_interleave(negatives.shape[1])
+                neg_logits = model.decoders.score_pairs(
+                    relation,
+                    embeddings[src_type],
+                    embeddings[dst_type],
+                    src_ids,
+                    negatives_device.reshape(-1),
+                ).reshape(positive.shape[1], -1)
+                relation_loss = weighted_infonce_loss(
+                    pos_logits,
+                    neg_logits,
+                    weights.to(device),
+                    float(train_cfg.get(temp_key, 0.2)),
+                )
+                relation_losses[relation] = relation_loss
+                row[f"{relation}_loss"] = float(relation_loss.detach())
+                row[f"loss_{relation}"] = float(relation_loss.detach())
+
+            graph_loss = (
+                loss_config.lambda_cg * relation_losses["cg"]
+                + loss_config.lambda_cp * relation_losses["cp"]
+            )
+            wnn_loss: torch.Tensor | None = None
+            if loss_config.lambda_wnn > 0:
+                if subgraph_sampler is None or global_node_ids is None:
+                    raise RuntimeError("WNN loss requires a sampled WNN batch.")
+                members = batch.diagnostics["context_member_ids"]
+                local_members = torch.searchsorted(
+                    global_node_ids["cell"], members
+                )
+                if not torch.equal(
+                    global_node_ids["cell"][local_members], members
+                ):
+                    raise RuntimeError("WNN members are absent from the sampled cell graph.")
+                wnn_loss = wnn_neighborhood_infonce_loss(
+                    embeddings["cell"],
+                    local_members[:, 0],
+                    local_members[:, 1:],
+                    batch.diagnostics["neighbor_weights"],
+                    num_negatives=int(train_cfg.get("negative_ratio_wnn", 5)),
+                    temperature=float(train_cfg.get("temperature_wnn", 0.2)),
+                    generator=wnn_generator,
+                )
+                row["wnn_loss"] = float(wnn_loss.detach())
+                row["loss_wnn"] = float(wnn_loss.detach())
+                row["wnn_negative_count"] = float(
+                    int(train_cfg.get("negative_ratio_wnn", 5))
+                )
+            total_loss = stage1_objective(
+                relation_losses["cg"],
+                relation_losses["cp"],
+                lambda_graph=loss_config.weights.lambda_graph,
+                lambda_cg=loss_config.lambda_cg,
+                lambda_cp=loss_config.lambda_cp,
+                wnn_loss=wnn_loss,
+                lambda_wnn=loss_config.lambda_wnn,
+                normalize_relation_weights=False,
+            )
+            total_loss.backward()
+            gradient_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), grad_clip_norm
+            )
+            optimizer.step()
+            graph_value = float(graph_loss.detach())
+            total_value = float(total_loss.detach())
             row.update(
                 {
-                    "subgraph_seed_cells": float(seed_ids.numel()),
-                    "subgraph_seed_checksum": float(
-                        _edge_checksum(torch.stack([seed_ids, seed_ids]))
-                    ),
-                    "subgraph_seed_cell_coverage": len(sampled_seed_cells)
-                    / float(build.data["cell"].num_nodes),
-                    "subgraph_context_cells": float(
-                        batch.diagnostics["context_cell_count"]
-                    ),
-                    "subgraph_cell_fraction": float(
-                        batch.data["cell"].num_nodes
-                    )
-                    / float(build.data["cell"].num_nodes),
+                    "graph_loss": graph_value,
+                    "L_graph": graph_value,
+                    "graph_status": "active",
+                    "loss": total_value,
+                    "loss_total": total_value,
+                    "total_loss": total_value,
+                    "gradient_norm": float(gradient_norm),
+                    "active_weight_lambda_graph": loss_config.weights.lambda_graph,
+                    "active_weight_lambda_cg": loss_config.lambda_cg,
+                    "active_weight_lambda_cp": loss_config.lambda_cp,
+                    "active_weight_lambda_wnn": loss_config.lambda_wnn,
                 }
             )
-            for node_type in ("cell", "gene", "peak"):
-                row[f"subgraph_{node_type}_nodes"] = float(
-                    batch.data[node_type].num_nodes
-                )
-            for relation, edge_type in STATE_RELATIONS.items():
-                reverse = (edge_type[2], f"rev_{edge_type[1]}", edge_type[0])
-                row[f"subgraph_{relation}_edges"] = float(
-                    batch.data[edge_type].edge_index.shape[1]
-                )
-                row[f"subgraph_rev_{relation}_edges"] = float(
-                    batch.data[reverse].edge_index.shape[1]
-                )
-        encoded_data = (
-            training_data
-            if device.type == "cpu"
-            else training_data.clone().to(device)
-        )
-        encoded_features = {
-            name: value.to(device) for name, value in training_features.items()
-        }
-        embeddings = model.encode(
-            encoded_data,
-            encoded_features,
-            global_node_ids=(
-                None if global_node_ids is None else dict(global_node_ids)
-            ),
-        )
-        relation_losses: dict[str, torch.Tensor] = {}
-        for relation, edge_type in STATE_RELATIONS.items():
-            src_type, dst_type, neg_key, temp_key = STATE_REL_CFG[relation]
-            relation_generator = relation_generators[relation]
-            if sampling_strategy in {"cell_balanced", "wnn_subgraph"}:
-                edges_per_cell = int(
-                    train_cfg.get(
-                        f"positive_edges_per_cell_{relation}",
-                        train_cfg.get("positive_edges_per_cell", 4),
-                    )
-                )
-                positive, weights = sample_positive_edges_by_source(
-                    training_data,
-                    edge_type,
-                    batch_size_cells,
-                    edges_per_cell,
-                    relation_generator,
-                )
-            else:
-                positive, weights = sample_positive_edges(
-                    training_data, edge_type, batch_size, relation_generator
-                )
-            global_positive = _global_edge_index(
-                positive, src_type, dst_type, global_node_ids
-            )
-            current_sources = set(map(int, global_positive[0].unique().tolist()))
-            sampled_sources[relation].update(current_sources)
-            row[f"{relation}_sampled_edges"] = float(positive.shape[1])
-            row[f"{relation}_sampled_cells"] = float(len(current_sources))
-            row[f"{relation}_cell_coverage"] = len(sampled_sources[relation]) / float(build.data["cell"].num_nodes)
-            negatives = sample_negative_targets(
-                positive,
-                int(training_data[dst_type].num_nodes),
-                int(train_cfg.get(neg_key, 5)),
-                relation_generator,
-                all_positive_edge_index=training_data[edge_type].edge_index,
-            )
-            row[f"{relation}_positive_checksum"] = float(
-                _edge_checksum(global_positive)
-            )
-            negative_edges = torch.stack(
-                [positive[0].repeat_interleave(negatives.shape[1]), negatives.reshape(-1)]
-            )
-            global_negative = _global_edge_index(
-                negative_edges, src_type, dst_type, global_node_ids
-            )
-            row[f"{relation}_negative_checksum"] = float(
-                _edge_checksum(global_negative)
-            )
-            positive_device = positive.to(device)
-            negatives_device = negatives.to(device)
-            pos_logits = model.decoders.score(
-                relation,
-                embeddings[src_type],
-                embeddings[dst_type],
-                positive_device,
-            )
-            src_ids = positive_device[0].repeat_interleave(negatives.shape[1])
-            neg_logits = model.decoders.score_pairs(
-                relation,
-                embeddings[src_type],
-                embeddings[dst_type],
-                src_ids,
-                negatives_device.reshape(-1),
-            ).reshape(positive.shape[1], -1)
-            loss = weighted_infonce_loss(
-                pos_logits,
-                neg_logits,
-                weights.to(device),
-                float(train_cfg.get(temp_key, 0.2)),
-            )
-            relation_losses[relation] = loss
-            row[f"{relation}_loss"] = float(loss.detach())
+            if model.initializer.atac_gate is not None:
+                row["atac_gate"] = float(model.initializer.atac_gate.detach())
 
-        graph_loss = 0.5 * (
-            relation_losses["cg"] + relation_losses["cp"]
-        )
-        graph_loss.backward()
-        optimizer.step()
-        graph_value = float(graph_loss.detach())
-        row.update(
-            {
-                "graph_loss": graph_value,
-                "L_graph": graph_value,
-                "graph_status": "active",
-                "loss": graph_value,
-                "total_loss": graph_value,
-                "active_weight_lambda_graph": 1.0,
-            }
-        )
-        if model.initializer.atac_gate is not None:
-            row["atac_gate"] = float(model.initializer.atac_gate.detach())
-        rows.append(row)
-        if checkpoint_selection == "last" or row["loss"] < best_loss:
-            best_loss = row["loss"]
-            best_state = {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
+            should_validate = bool(validation) and (
+                global_step % validation_interval == 0
+                or global_step == total_planned_steps
+            )
+            if should_validate:
+                validation_count += 1
+                validation_metrics = _evaluate_fixed_validation(
+                    model,
+                    build,
+                    training_graph,
+                    validation,
+                    loss_config,
+                    train_cfg,
+                    device,
+                    subgraph_sampler,
+                )
+                row.update(validation_metrics)
+            selection_value: float | None = None
+            if checkpoint_selection == "last":
+                selection_value = total_value
+            elif checkpoint_selection == "loss":
+                if total_value < best_loss:
+                    selection_value = total_value
+            elif should_validate:
+                current_validation = float(row["validation_loss"])
+                if current_validation < best_loss:
+                    selection_value = current_validation
+                    validations_without_improvement = 0
+                else:
+                    validations_without_improvement += 1
+            if selection_value is not None:
+                best_loss = selection_value
+                best_global_step = global_step
+                best_state = {
+                    name: value.detach().cpu().clone()
+                    for name, value in model.state_dict().items()
+                }
+                best_optimizer_state = copy.deepcopy(optimizer.state_dict())
+            row["best_global_step"] = float(best_global_step)
+            row["validation_count"] = float(validation_count)
+            rows.append(row)
+            if global_step == 1 or global_step % log_interval == 0:
+                LOGGER.info(
+                    "Stage1 epoch=%d step=%d global_step=%d loss_total=%.6f "
+                    "loss_cg=%.6f loss_cp=%.6f negatives_cg=%d negatives_cp=%d",
+                    epoch,
+                    step_in_epoch,
+                    global_step,
+                    total_value,
+                    row["loss_cg"],
+                    row["loss_cp"],
+                    int(row["cg_negative_count"]),
+                    int(row["cp_negative_count"]),
+                )
+            if (
+                checkpoint_selection == "validation"
+                and should_validate
+                and validations_without_improvement >= early_stopping_patience
+            ):
+                row["early_stopping_triggered"] = 1.0
+                stop_training = True
+                break
+        if stop_training:
+            break
 
     if best_state is None:
         raise RuntimeError("Stage-1 training produced no checkpoint.")
@@ -497,8 +903,21 @@ def train_state(
         output_dir / "checkpoints" / "stage1_best.pt",
         stage="stage1",
         model_state=best_state,
+        optimizer_state=best_optimizer_state,
         model_config=model.model_config,
         config=config,
+        global_step=best_global_step,
+        random_seed=base_seed,
+        checkpoint_selection=checkpoint_selection,
+        best_selection_loss=best_loss,
+        validation_positive_edges={
+            relation: values["positive"].cpu()
+            for relation, values in validation.items()
+        },
+        validation_negative_targets={
+            relation: values["negative"].cpu()
+            for relation, values in validation.items()
+        },
         names=build.names,
         features={name: value.cpu() for name, value in build.features.items()},
         embeddings={name: value.cpu() for name, value in embeddings.items()},

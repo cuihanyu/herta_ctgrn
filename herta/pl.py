@@ -25,10 +25,11 @@ def training_metrics(metrics: pd.DataFrame | str | Path, y: str = "loss") -> plt
     """Plot training metrics from a DataFrame or ``train_metrics.csv`` path."""
 
     df = pd.read_csv(metrics) if isinstance(metrics, str | Path) else metrics
+    x = "global_step" if "global_step" in df else "epoch"
     fig, ax = plt.subplots(figsize=settings.figure_params.get("figsize", (6, 3.5)))
-    sns.lineplot(data=df, x="epoch", y=y, marker="o", ax=ax)
+    sns.lineplot(data=df, x=x, y=y, marker="o", ax=ax)
     ax.set_title(f"Training {y}")
-    ax.set_xlabel("epoch")
+    ax.set_xlabel(x.replace("_", " "))
     ax.set_ylabel(y)
     return _save_or_return(fig, f"training_{y}.png")
 
