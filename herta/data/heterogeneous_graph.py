@@ -16,6 +16,7 @@ from herta.data.edge_tables import (
     RELATIONS,
     EdgeTableBundle,
     validate_edge_table,
+    validate_state_edge_table,
 )
 
 
@@ -197,7 +198,10 @@ def _coded_edge_attribute(
     *,
     default: float,
 ) -> torch.Tensor:
-    values = table[column].astype(str).map(mapping).fillna(default).to_numpy()
+    if column not in table:
+        values = np.full(len(table), default)
+    else:
+        values = table[column].astype(str).map(mapping).fillna(default).to_numpy()
     dtype = torch.long if all(isinstance(value, int) for value in mapping.values()) else torch.float32
     return torch.as_tensor(values, dtype=dtype)
 
@@ -240,11 +244,12 @@ def _add_message_relation(
         else table.index.to_numpy(dtype=np.int64)
     )
     data[edge_type].table_row = torch.as_tensor(table_rows, dtype=torch.long)
+    is_state_relation = relation_key in MESSAGE_RELATIONS
     data[edge_type].split_code = _coded_edge_attribute(
-        table, "split", SPLIT_CODES, default=-1
+        table, "split", SPLIT_CODES, default=0 if is_state_relation else -1
     )
     data[edge_type].label = _coded_edge_attribute(
-        table, "label_status", LABEL_CODES, default=-1.0
+        table, "label_status", LABEL_CODES, default=1.0 if is_state_relation else -1.0
     )
     if "raw_value" in table:
         data[edge_type].raw_value = _numeric_edge_attribute(
@@ -364,7 +369,10 @@ def edge_tables_to_heterodata(
     features = _features(node_features, names)
     tables = {name: table.copy() for name, table in edge_tables.as_dict().items()}
     for relation_key, table in tables.items():
-        validate_edge_table(table, expected_relation=relation_key)
+        if relation_key in MESSAGE_RELATIONS:
+            validate_state_edge_table(table, expected_relation=relation_key)
+        else:
+            validate_edge_table(table, expected_relation=relation_key)
 
     indices = {
         node_type: {name: index for index, name in enumerate(node_names)}

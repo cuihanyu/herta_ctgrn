@@ -30,6 +30,17 @@ RELATIONS: Mapping[str, tuple[str, str, str]] = {
 MESSAGE_RELATIONS = ("cell_gene", "cell_peak")
 QUERY_RELATIONS = ("peak_gene", "tf_peak", "tf_target")
 
+STATE_EDGE_TABLE_COLUMNS = [
+    "source_id",
+    "target_id",
+    "source_type",
+    "target_type",
+    "relation",
+    "raw_value",
+    "edge_weight",
+    "selection_method",
+]
+
 RELATION_EXTRA_COLUMNS: Mapping[str, tuple[str, ...]] = {
     "cell_gene": (
         "edge_weight",
@@ -267,6 +278,74 @@ def validate_edge_table(
             )
 
 
+def validate_state_edge_table(
+    table: pd.DataFrame,
+    *,
+    expected_relation: str,
+) -> None:
+    """Validate the compact Stage-1 observed-edge contract."""
+
+    if expected_relation not in MESSAGE_RELATIONS:
+        raise ValueError("State edge tables support only cell_gene and cell_peak.")
+    if list(table.columns) != STATE_EDGE_TABLE_COLUMNS:
+        raise ValueError(
+            "Stage-1 edge columns must exactly match "
+            f"{STATE_EDGE_TABLE_COLUMNS}; observed {list(table.columns)}."
+        )
+    if table.empty:
+        return
+    source_type, relation, target_type = RELATIONS[expected_relation]
+    observed = set(
+        table[["source_type", "relation", "target_type"]]
+        .astype(str)
+        .itertuples(index=False, name=None)
+    )
+    if observed != {(source_type, relation, target_type)}:
+        raise ValueError(
+            f"Stage-1 relation mismatch for {expected_relation}: {sorted(observed)}."
+        )
+    for column in (
+        "source_id",
+        "target_id",
+        "source_type",
+        "target_type",
+        "relation",
+        "selection_method",
+    ):
+        values = table[column].astype("string")
+        if values.isna().any() or values.str.strip().eq("").any():
+            raise ValueError(f"Stage-1 edge column '{column}' must be non-empty.")
+    for column in ("raw_value", "edge_weight"):
+        values = pd.to_numeric(table[column], errors="coerce").to_numpy(dtype=float)
+        if not np.isfinite(values).all() or np.any(values <= 0):
+            raise ValueError(
+                f"Stage-1 edge column '{column}' must be finite and positive."
+            )
+    if table.duplicated(["source_id", "target_id"]).any():
+        raise ValueError("Stage-1 observed edges must have unique endpoints.")
+
+
+def _finalize_state_edge_table(
+    rows: list[dict[str, object]],
+    *,
+    relation_key: str,
+) -> pd.DataFrame:
+    result = pd.DataFrame(rows, columns=STATE_EDGE_TABLE_COLUMNS)
+    for column in (
+        "source_id",
+        "target_id",
+        "source_type",
+        "target_type",
+        "relation",
+        "selection_method",
+    ):
+        result[column] = result[column].astype("string")
+    for column in ("raw_value", "edge_weight"):
+        result[column] = pd.to_numeric(result[column], errors="raise").astype(float)
+    validate_state_edge_table(result, expected_relation=relation_key)
+    return result.reset_index(drop=True)
+
+
 def empty_edge_table(relation_key: str) -> pd.DataFrame:
     """Return an empty table that still exposes the complete relation schema."""
 
@@ -299,11 +378,6 @@ def _build_observed_edges(
     sources = _ids(source_ids, "source_ids")
     targets = _ids(target_ids, "target_ids")
     matrix = _observed_matrix(values, (len(sources), len(targets)), "values")
-    raw = (
-        matrix
-        if raw_values is None
-        else _matrix(raw_values, matrix.shape, "raw_values")
-    )
     if top_k is not None and top_k <= 0:
         raise ValueError("top_k must be positive when specified.")
 
@@ -321,8 +395,6 @@ def _build_observed_edges(
         normalized = (
             selected / denominator if denominator > 0 else np.zeros_like(selected)
         )
-        raw_row = raw.getrow(source_index)
-        raw_lookup = dict(zip(raw_row.indices.tolist(), raw_row.data.tolist()))
         for target_index, value, weight in zip(indices, selected, normalized):
             rows.append(
                 {
@@ -331,33 +403,17 @@ def _build_observed_edges(
                     "source_type": source_type,
                     "target_type": target_type,
                     "relation": relation,
-                    "prior_score": float(weight),
-                    "edge_weight": float(value),
-                    "evidence_type": (
-                        "observed_expression"
-                        if relation_key == "cell_gene"
-                        else "observed_accessibility"
-                    ),
-                    "evidence_id": "input_matrix",
-                    "distance": pd.NA,
-                    "chrom": pd.NA,
-                    "genome_build": pd.NA,
-                    "label_status": "observed",
-                    "split": "message",
-                    "raw_value": float(raw_lookup.get(int(target_index), 0.0)),
-                    "normalized_value": float(value),
-                    "normalized_weight": float(weight),
+                    "raw_value": float(value),
+                    "edge_weight": float(weight),
                     "selection_method": (
                         "all_positive" if top_k is None else f"row_top_{top_k}"
                     ),
                 }
             )
-    result = _finalize_edge_table(
-        pd.DataFrame(rows),
-        extra_columns=list(RELATION_EXTRA_COLUMNS[relation_key]),
+    return _finalize_state_edge_table(
+        rows,
+        relation_key=relation_key,
     )
-    validate_edge_table(result, expected_relation=relation_key)
-    return result
 
 
 def _build_cell_gene_union_edges(
@@ -374,7 +430,6 @@ def _build_cell_gene_union_edges(
     sources = _ids(source_ids, "source_ids")
     targets = _ids(target_ids, "target_ids")
     matrix = _observed_matrix(values, (len(sources), len(targets)), "values")
-    raw = matrix if raw_values is None else _matrix(raw_values, matrix.shape, "raw_values")
     if top_k is not None and top_k <= 0:
         raise ValueError("top_k must be positive when specified.")
     if gene_cell_quantile is not None and not 0 <= gene_cell_quantile <= 1:
@@ -405,7 +460,7 @@ def _build_cell_gene_union_edges(
             thresholds[column] = lower + fraction * (upper - lower)
 
     rows: list[dict[str, object]] = []
-    csr, raw_csr = matrix.tocsr(), raw.tocsr()
+    csr = matrix.tocsr()
     for source_index in range(csr.shape[0]):
         row = csr.getrow(source_index)
         quantile_targets = set(
@@ -424,8 +479,6 @@ def _build_cell_gene_union_edges(
         indices, selected = row.indices[keep], row.data[keep]
         denominator = float(selected.sum())
         weights = selected / denominator if denominator > 0 else np.zeros_like(selected)
-        raw_row = raw_csr.getrow(source_index)
-        raw_lookup = dict(zip(raw_row.indices.tolist(), raw_row.data.tolist()))
         for target_index, value, weight in zip(indices, selected, weights):
             in_top = int(target_index) in top_targets
             in_quantile = int(target_index) in quantile_targets
@@ -445,31 +498,15 @@ def _build_cell_gene_union_edges(
                     "source_type": "cell",
                     "target_type": "gene",
                     "relation": "expresses",
-                    "prior_score": float(weight),
-                    "edge_weight": float(value),
-                    "evidence_type": "observed_expression",
-                    "evidence_id": "log_normalized_expression",
-                    "distance": pd.NA,
-                    "chrom": pd.NA,
-                    "genome_build": pd.NA,
-                    "label_status": "observed",
-                    "split": "message",
-                    "raw_value": float(raw_lookup.get(int(target_index), 0.0)),
-                    "normalized_value": float(value),
-                    "normalized_weight": float(weight),
+                    "raw_value": float(value),
+                    "edge_weight": float(weight),
                     "selection_method": selection_method,
-                    "expression_threshold": float(thresholds[target_index]),
-                    "percentile": (
-                        pd.NA if percentile is None else float(percentile)
-                    ),
                 }
             )
-    result = _finalize_edge_table(
-        pd.DataFrame(rows),
-        extra_columns=list(RELATION_EXTRA_COLUMNS["cell_gene"]),
+    return _finalize_state_edge_table(
+        rows,
+        relation_key="cell_gene",
     )
-    validate_edge_table(result, expected_relation="cell_gene")
-    return result
 
 
 def build_cell_gene_edges(
@@ -814,7 +851,11 @@ class EdgeTableBundle:
     tf_target: pd.DataFrame | None = None
 
     def __post_init__(self) -> None:
-        for relation_key in ("cell_gene", "cell_peak", "peak_gene", "tf_peak"):
+        for relation_key in MESSAGE_RELATIONS:
+            validate_state_edge_table(
+                getattr(self, relation_key), expected_relation=relation_key
+            )
+        for relation_key in ("peak_gene", "tf_peak"):
             validate_edge_table(
                 getattr(self, relation_key), expected_relation=relation_key
             )

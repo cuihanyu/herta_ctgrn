@@ -41,38 +41,6 @@ class StateGraphBuildResult:
     audit: dict[str, object]
 
 
-def _row_topk(matrix: object, k: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    x = sparse.csr_matrix(matrix)
-    rows: list[int] = []
-    cols: list[int] = []
-    values: list[float] = []
-    for row_id in range(x.shape[0]):
-        start, end = x.indptr[row_id], x.indptr[row_id + 1]
-        idx = x.indices[start:end]
-        val = x.data[start:end]
-        keep = val > 0
-        idx, val = idx[keep], val[keep]
-        if len(val) > k:
-            chosen = np.argpartition(val, -k)[-k:]
-            idx, val = idx[chosen], val[chosen]
-        denom = float(val.sum()) + 1e-8
-        rows.extend([row_id] * len(idx))
-        cols.extend(idx.astype(int).tolist())
-        values.extend((val / denom).astype(float).tolist())
-    return np.asarray(rows), np.asarray(cols), np.asarray(values, dtype=np.float32)
-
-
-def _add_relation(data: HeteroData, edge_type: tuple[str, str, str], matrix: object, top_k: int) -> None:
-    src, dst, weight = _row_topk(matrix, top_k)
-    edge_index = torch.as_tensor(np.vstack([src, dst]), dtype=torch.long)
-    edge_weight = torch.as_tensor(weight, dtype=torch.float32)
-    data[edge_type].edge_index = edge_index
-    data[edge_type].edge_weight = edge_weight
-    reverse = (edge_type[2], f"rev_{edge_type[1]}", edge_type[0])
-    data[reverse].edge_index = edge_index.flip(0)
-    data[reverse].edge_weight = edge_weight.clone()
-
-
 def build_state_graph(
     multiome: MultiomeData,
     factors: MultiomeFactors | None = None,
@@ -256,7 +224,24 @@ def build_state_graph(
             edge_weight.cpu().numpy()
         )
     cp_edge_type = STATE_RELATIONS["cp"]
+    cg_edge_type = STATE_RELATIONS["cg"]
+    cg_unique_genes = int(torch.unique(graph.data[cg_edge_type].edge_index[1]).numel())
     cp_unique_peaks = int(torch.unique(graph.data[cp_edge_type].edge_index[1]).numel())
+    reverse_edge_parity: dict[str, bool] = {}
+    for relation, edge_type in STATE_RELATIONS.items():
+        reverse = (edge_type[2], f"rev_{edge_type[1]}", edge_type[0])
+        forward_index = graph.data[edge_type].edge_index
+        reverse_index = graph.data[reverse].edge_index
+        parity = bool(
+            torch.equal(reverse_index, forward_index.flip(0))
+            and torch.equal(
+                graph.data[reverse].edge_weight,
+                graph.data[edge_type].edge_weight,
+            )
+        )
+        if not parity:
+            raise RuntimeError(f"Forward/reverse edge mismatch for {relation}.")
+        reverse_edge_parity[relation] = parity
     feature_nonfinite = {
         node_type: int((~torch.isfinite(values)).sum())
         for node_type, values in features.items()
@@ -282,7 +267,11 @@ def build_state_graph(
             "gene_cell_quantile": gene_cell_quantile,
             "cell_peak_selection": "per_cell_tfidf_top_k",
             "top_cell_peak": top_cell_peak,
+            "cg_unique_gene_count": cg_unique_genes,
+            "gene_coverage": float(cg_unique_genes / max(len(gene_names), 1)),
             "cp_unique_peak_count": cp_unique_peaks,
+            "peak_coverage": float(cp_unique_peaks / max(len(peak_names), 1)),
+            "forward_reverse_edge_parity": reverse_edge_parity,
             "rna_library_size": summary(rna_library_size),
             "atac_library_size": summary(atac_library_size),
             "atac_lsi_first_library_size_correlation": (
