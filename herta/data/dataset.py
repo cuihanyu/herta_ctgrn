@@ -433,13 +433,20 @@ def prepare_multiome(
         raise ValueError("prepare_multiome requires an explicit genome_build.")
     if n_cells is not None and n_cells <= 0:
         raise ValueError("`n_cells` must be positive when specified.")
-    if n_variable_peaks is not None and n_variable_peaks <= 0:
-        raise ValueError("`n_variable_peaks` must be positive when specified.")
+    if n_variable_peaks is not None and n_variable_peaks < 2:
+        raise ValueError("`n_variable_peaks` must be at least two when specified.")
+    if n_peaks is not None and n_peaks < 2:
+        raise ValueError("`n_peaks` must be at least two when specified.")
+    if peak_selection != "detection_variance":
+        raise ValueError(
+            "Canonical prepare_multiome peak selection is fixed to "
+            "'detection_variance'; LSI/prior-based Stage-1 selection is disabled."
+        )
     if retain_hvg_guidance or retain_tf_motif:
         warnings.warn(
             "`retain_hvg_guidance` and `retain_tf_motif` are deprecated and ignored: "
             "the minimal peak universe is selected only by coordinate/support QC "
-            "and LSI loading variability.",
+            "and ATAC detection variability.",
             FutureWarning,
             stacklevel=2,
         )
@@ -460,11 +467,6 @@ def prepare_multiome(
                 "In-memory RNA and ATAC AnnData objects must have identical obs_names "
                 "in the same order."
             )
-        if n_peaks is not None and n_peaks < atac_path.n_vars:
-            raise ValueError(
-                "Apply peak preselection with load_multiome_anndata before passing "
-                "in-memory AnnData objects, then set n_peaks=None."
-            )
         rna, atac = rna_path.copy(), atac_path.copy()
     else:
         rna, atac = load_multiome_anndata(
@@ -474,8 +476,8 @@ def prepare_multiome(
             rna_suffix_pattern=rna_suffix_pattern,
             atac_suffix_pattern=atac_suffix_pattern,
             n_cells=None,
-            n_peaks=n_peaks,
-            peak_selection=peak_selection,
+            n_peaks=None,
+            peak_selection="detection_variance",
             peak_min_fraction=peak_min_fraction,
             peak_max_fraction=peak_max_fraction,
             random_state=random_state,
@@ -490,6 +492,7 @@ def prepare_multiome(
         genome_build=genome_build,
         require_genome_build=True,
     )
+    n_input_genes = int(rna.n_vars)
     n_input_peaks = int(atac.n_vars)
     cell_peak_nnz_before = _positive_nnz(atac.X)
     parse_peak_coordinates(
@@ -548,30 +551,18 @@ def prepare_multiome(
             min_cells_floor=peak_min_cells_floor,
             min_cell_fraction=peak_min_cell_fraction,
         )
-        lsi(
-            atac,
-            n_components=n_atac_components,
-            use_highly_variable=False,
-            n_iter=n_iter,
-            binarize=False,
-            store_loadings=True,
-            drop_first_component=False,
-            random_state=random_state,
-        )
-        resolved_n_variable_peaks = min(
-            10_000 if n_variable_peaks is None else int(n_variable_peaks),
-            atac.n_vars,
-        )
+        requested_peak_budget = 10_000 if n_variable_peaks is None else int(n_variable_peaks)
+        if n_peaks is not None:
+            requested_peak_budget = min(requested_peak_budget, int(n_peaks))
+        resolved_n_variable_peaks = min(requested_peak_budget, atac.n_vars)
         highly_variable_peaks(
             atac,
             min_fraction=0.0,
             max_fraction=1.0,
             n_top_peaks=resolved_n_variable_peaks,
-            selection_method="lsi_loading",
-            exclude_first_lsi=not variable_include_first_component,
+            selection_method="detection_variance",
         )
         variable_mask = np.asarray(atac.var["highly_variable"], dtype=bool)
-        atac.var["lsi_loading_score"] = atac.var["variability_score"].to_numpy()
         atac.var["variable_peak"] = variable_mask
 
         guidance_mask = np.zeros(atac.n_vars, dtype=bool)
@@ -602,29 +593,28 @@ def prepare_multiome(
                 cell_peak_nnz_after=retained_nnz,
             ),
             "enabled": True,
-            "selection_contract": "coordinate_support_qc_then_lsi_loading_variability",
-            "n_variable_peaks_requested": 10_000 if n_variable_peaks is None else int(n_variable_peaks),
+            "selection_contract": "coordinate_support_qc_then_detection_variability",
+            "n_variable_peaks_requested": int(requested_peak_budget),
             "n_variable_peaks_resolved": int(resolved_n_variable_peaks),
             "variable_include_first_component": variable_include_first_component,
             "retain_hvg_guidance": False,
             "retain_tf_motif": False,
-            "refit_lsi_after_union": refit_lsi_after_union,
+            "refit_lsi_after_union": False,
             "input_peak_cap": n_peaks,
         }
         atac = atac[:, retained_mask].copy()
-        refit_performed = bool(refit_lsi_after_union and atac.n_vars >= 2)
-        peak_filter_audit["refit_lsi_performed"] = refit_performed
-        if refit_performed:
-            lsi(
-                atac,
-                n_components=n_atac_components,
-                use_highly_variable=False,
-                n_iter=n_iter,
-                binarize=False,
-                store_loadings=True,
-                drop_first_component=drop_first_lsi,
-                random_state=random_state,
-            )
+        peak_filter_audit["refit_lsi_performed"] = False
+        peak_filter_audit["lsi_fit_count"] = 1
+        lsi(
+            atac,
+            n_components=n_atac_components,
+            use_highly_variable=False,
+            n_iter=n_iter,
+            binarize=False,
+            store_loadings=True,
+            drop_first_component=drop_first_lsi,
+            random_state=random_state,
+        )
         atac.var["highly_variable"] = True
         atac.uns["herta_preprocessing"] = {
             **atac.uns.get("herta_preprocessing", {}),
@@ -658,6 +648,7 @@ def prepare_multiome(
             "cell_peak_nnz_after": _positive_nnz(atac.X),
             "mean_cell_peak_degree_after": float(_positive_nnz(atac.X) / atac.n_obs),
             "input_peak_cap": n_peaks,
+            "lsi_fit_count": 1,
         }
 
     if n_cells is not None and n_cells < rna.n_obs:
@@ -789,6 +780,27 @@ def prepare_multiome(
             "requested_n_genes": int(n_genes),
             "selected_n_genes": int(len(selected_genes)),
         },
+    }
+    hvg_mask = np.asarray(rna_selected.var["highly_variable"], dtype=bool)
+    tf_mask = np.asarray(genes["is_tf"], dtype=bool)
+    universe_audit = {
+        "n_cells": int(multiome.rna.shape[0]),
+        "n_input_genes": n_input_genes,
+        "n_hvg": int(hvg_mask.sum()),
+        "n_eligible_tf": int(len(eligible_tfs)),
+        "n_non_hvg_tf_retained": int((tf_mask & ~hvg_mask).sum()),
+        "n_final_genes": int(multiome.rna.shape[1]),
+        "n_input_peaks": n_input_peaks,
+        "n_support_pass_peaks": int(peak_filter_audit["n_support_pass"]),
+        "n_variable_peaks": int(multiome.atac.shape[1]),
+        "n_final_peaks": int(multiome.atac.shape[1]),
+    }
+    metadata["universe_audit"] = universe_audit
+    metadata["preprocessing_audit"] = {
+        "rna_pca_fit_count": 1,
+        "atac_lsi_fit_count": int(peak_filter_audit["lsi_fit_count"]),
+        "hvg_selection_count": 1,
+        "peak_selection_count": 1,
     }
     return multiome, metadata
 
