@@ -98,7 +98,9 @@ def sample_positive_edges_for_cells(
     cell_ids: torch.Tensor,
     edges_per_cell: int,
     generator: torch.Generator | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    *,
+    return_indices: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sample relation positives for an explicit shared batch of cell IDs."""
 
     if edges_per_cell < 1:
@@ -117,4 +119,5 @@ def sample_positive_edges_for_cells(
         * counts[cell_ids, None]
     ).long()
     indices = (starts[cell_ids, None] + offsets).reshape(-1)
-    return edge_index[:, indices], weights[indices]
+    sampled = (edge_index[:, indices], weights[indices])
+    return (*sampled, indices) if return_indices else sampled

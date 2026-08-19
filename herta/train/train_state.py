@@ -15,7 +15,13 @@ from herta.data.sampler import (
     sample_cells_with_all_relations,
     sample_positive_edges_for_cells,
 )
-from herta.data.sampling import CellKNNSampler, SamplerConfig, SubgraphBatch
+from herta.data.sampling import (
+    CellFeatureSubgraphConfig,
+    CellFeatureSubgraphSampler,
+    CellKNNSampler,
+    SamplerConfig,
+    SubgraphBatch,
+)
 from herta.data.state_graph import STATE_RELATIONS, StateGraphBuildResult
 from herta.model.losses import (
     Stage1LossConfig,
@@ -249,6 +255,36 @@ def _edge_checksum(edge_index: torch.Tensor) -> int:
     return int(((values[0] + 1) * 1_000_003 + values[1] + 1).sum())
 
 
+def _positive_row_index(
+    edge_index: torch.Tensor, num_sources: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cache row starts/counts for source-grouped global positive edges."""
+
+    sources = edge_index[0]
+    if sources.numel() > 1 and not bool(torch.all(sources[1:] >= sources[:-1])):
+        raise ValueError("Stage-1 positive edges must be grouped by cell source.")
+    counts = torch.bincount(sources, minlength=num_sources)
+    return torch.cumsum(counts, dim=0) - counts, counts
+
+
+def _count_negative_positive_collisions(
+    positive: torch.Tensor,
+    negatives: torch.Tensor,
+    all_positive: torch.Tensor,
+    row_index: tuple[torch.Tensor, torch.Tensor],
+) -> int:
+    """Audit sampled targets against the complete observed source rows."""
+
+    starts, counts = row_index
+    collisions = 0
+    for source in torch.unique(positive[0]).tolist():
+        start = int(starts[source])
+        observed = all_positive[1, start : start + int(counts[source])]
+        sampled = negatives[positive[0] == source].flatten()
+        collisions += int(torch.isin(sampled, observed).sum())
+    return collisions
+
+
 def _seed_torch_dropout(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -470,6 +506,14 @@ def train_state(
         raise ValueError(
             "The formal Stage-1 baseline requires sampling_strategy='cell_balanced'."
         )
+    graph_batch_mode = str(
+        train_cfg.get("graph_batch_mode", "cell_feature_subgraph")
+    )
+    if graph_batch_mode not in {"cell_feature_subgraph", "full_graph"}:
+        raise ValueError(
+            "state_training.graph_batch_mode must be 'cell_feature_subgraph' "
+            "or 'full_graph'."
+        )
     checkpoint_selection = str(
         train_cfg.get(
             "checkpoint_selection",
@@ -496,40 +540,52 @@ def train_state(
         )
     training_graph, validation = build.data, {}
     batch_size_cells = int(train_cfg.get("batch_size_cells", 1024))
-    subgraph_sampler: CellKNNSampler | None = None
     subgraph_generator = torch.Generator().manual_seed(base_seed + 3_001)
-    wnn_generator = torch.Generator().manual_seed(base_seed + 5_001)
-    subgraph_seed_cells = int(train_cfg.get("subgraph_seed_cells", 128))
-    if sampling_strategy == "wnn_subgraph":
-        n_cells = int(training_graph["cell"].num_nodes)
-        subgraph_neighbors = int(train_cfg.get("subgraph_neighbors", 20))
-        subgraph_candidates = int(train_cfg.get("subgraph_candidate_neighbors", 100))
-        if not 1 <= subgraph_seed_cells <= n_cells:
-            raise ValueError(
-                "state_training.subgraph_seed_cells must be between 1 and n_cells."
+    positive_edges_per_cell = {
+        relation: int(
+            train_cfg.get(
+                f"positive_edges_per_cell_{relation}",
+                train_cfg.get("positive_edges_per_cell", 4),
             )
-        if not 1 <= subgraph_neighbors < n_cells:
-            raise ValueError(
-                "state_training.subgraph_neighbors must be between 1 and n_cells - 1."
-            )
-        subgraph_sampler = CellKNNSampler(
-            training_graph,
-            SamplerConfig(
-                seed=base_seed,
-                n_neighbors=subgraph_neighbors,
-                candidate_neighbors=subgraph_candidates,
-                neighbor_temperature=float(
-                    train_cfg.get("subgraph_neighbor_temperature", 0.2)
-                ),
-                include_reverse_edges=True,
-                negative_ratio=max(
-                    int(train_cfg.get("negative_ratio_cg", 5)),
-                    int(train_cfg.get("negative_ratio_cp", 5)),
-                ),
-            ),
-            rna_pca=build.factors.rna_cell_scores,
-            atac_lsi=build.factors.atac_cell_scores,
         )
+        for relation in STATE_RELATIONS
+    }
+    subgraph_budgets = CellFeatureSubgraphConfig(
+        message_edges_per_cell_cg=int(
+            train_cfg.get("message_edges_per_cell_cg", 64)
+        ),
+        message_edges_per_cell_cp=int(
+            train_cfg.get("message_edges_per_cell_cp", 128)
+        ),
+        context_cells_per_gene=int(train_cfg.get("context_cells_per_gene", 4)),
+        context_cells_per_peak=int(train_cfg.get("context_cells_per_peak", 4)),
+        max_context_cells=int(train_cfg.get("max_context_cells", 512)),
+    )
+    if (
+        subgraph_budgets.message_edges_per_cell_cg
+        < positive_edges_per_cell["cg"]
+        or subgraph_budgets.message_edges_per_cell_cp
+        < positive_edges_per_cell["cp"]
+    ):
+        raise ValueError(
+            "Stage-1 message fanouts must be at least the per-cell supervision budgets."
+        )
+    state_subgraph_sampler = (
+        CellFeatureSubgraphSampler(
+            training_graph,
+            SamplerConfig(seed=base_seed, preserve_all_cells=False),
+            budgets=subgraph_budgets,
+        )
+        if graph_batch_mode == "cell_feature_subgraph"
+        else None
+    )
+    global_positive_rows = {
+        relation: _positive_row_index(
+            training_graph[edge_type].edge_index,
+            int(training_graph[edge_type[0]].num_nodes),
+        )
+        for relation, edge_type in STATE_RELATIONS.items()
+    }
     sampled_sources: dict[str, set[int]] = {relation: set() for relation in STATE_RELATIONS}
     sampled_seed_cells: set[int] = set()
     rows: list[dict[str, float | str]] = []
@@ -555,55 +611,123 @@ def train_state(
                 _seed_torch_dropout(base_seed + 10_000 + global_step)
             model.train()
             optimizer.zero_grad()
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
             row: dict[str, float | str] = {
                 "epoch": float(epoch),
                 "step_in_epoch": float(step_in_epoch),
                 "global_step": float(global_step),
                 "rng_mode": rng_mode,
                 "sampling_strategy": sampling_strategy,
+                "graph_batch_mode": graph_batch_mode,
             }
-            training_data = training_graph
-            training_features = build.features
+            sampled_cells = sample_cells_with_all_relations(
+                training_graph,
+                tuple(STATE_RELATIONS.values()),
+                batch_size_cells,
+                generator,
+            )
+            sampled_seed_cells.update(map(int, sampled_cells.tolist()))
+            row["sampled_cell_count"] = float(sampled_cells.numel())
+            row["seed_cell_count"] = float(sampled_cells.numel())
+
+            sampled_payload: dict[str, dict[str, torch.Tensor]] = {}
+            required_edge_ids: dict[tuple[str, str, str], torch.Tensor] = {}
+            extra_node_parts: dict[str, list[torch.Tensor]] = {
+                "gene": [],
+                "peak": [],
+            }
+            collision_count = 0
+            for relation, edge_type in STATE_RELATIONS.items():
+                src_type, dst_type, neg_key, _ = STATE_REL_CFG[relation]
+                relation_generator = relation_generators[relation]
+                positive, weights, positive_ids = sample_positive_edges_for_cells(
+                    training_graph,
+                    edge_type,
+                    sampled_cells,
+                    positive_edges_per_cell[relation],
+                    relation_generator,
+                    return_indices=True,
+                )
+                negatives = sample_negative_targets(
+                    positive,
+                    int(training_graph[dst_type].num_nodes),
+                    int(train_cfg.get(neg_key, 5)),
+                    relation_generator,
+                    all_positive_edge_index=training_graph[edge_type].edge_index,
+                )
+                collisions = _count_negative_positive_collisions(
+                    positive,
+                    negatives,
+                    training_graph[edge_type].edge_index,
+                    global_positive_rows[relation],
+                )
+                if collisions:
+                    raise RuntimeError(
+                        f"Global observed-positive collision in {relation} negatives."
+                    )
+                collision_count += collisions
+                sampled_payload[relation] = {
+                    "positive": positive,
+                    "weights": weights,
+                    "negative": negatives,
+                }
+                required_edge_ids[edge_type] = positive_ids
+                extra_node_parts[dst_type].append(negatives.flatten())
+
+            batch = None
             global_node_ids: Mapping[str, torch.Tensor] | None = None
-            if subgraph_sampler is not None:
-                seed_ids = torch.randperm(
-                    int(training_graph["cell"].num_nodes),
+            if state_subgraph_sampler is not None:
+                batch = state_subgraph_sampler.sample(
+                    sampled_cells,
+                    required_edge_ids=required_edge_ids,
+                    extra_node_ids={
+                        node_type: torch.cat(parts)
+                        for node_type, parts in extra_node_parts.items()
+                        if parts
+                    },
                     generator=subgraph_generator,
-                )[:subgraph_seed_cells]
-                sampled_seed_cells.update(map(int, seed_ids.tolist()))
-                batch = subgraph_sampler.sample(seed_ids)
+                )
                 training_data = batch.data
                 training_features = _subgraph_features(build, batch)
                 global_node_ids = batch.global_node_ids
-                row.update(
-                    {
-                        "subgraph_seed_cells": float(seed_ids.numel()),
-                        "subgraph_seed_checksum": float(
-                            _edge_checksum(torch.stack([seed_ids, seed_ids]))
-                        ),
-                        "subgraph_seed_cell_coverage": len(sampled_seed_cells)
-                        / float(build.data["cell"].num_nodes),
-                        "subgraph_context_cells": float(
-                            batch.diagnostics["context_cell_count"]
-                        ),
-                        "subgraph_cell_fraction": float(
-                            batch.data["cell"].num_nodes
-                        )
-                        / float(build.data["cell"].num_nodes),
-                    }
+            else:
+                training_data = training_graph
+                training_features = build.features
+
+            context_count = (
+                int(batch.diagnostics["context_cell_count"])
+                if batch is not None
+                else int(training_data["cell"].num_nodes - sampled_cells.numel())
+            )
+            row.update(
+                {
+                    "context_cell_count": float(context_count),
+                    "subgraph_seed_cells": float(sampled_cells.numel()),
+                    "subgraph_seed_checksum": float(
+                        _edge_checksum(torch.stack([sampled_cells, sampled_cells]))
+                    ),
+                    "subgraph_seed_cell_coverage": len(sampled_seed_cells)
+                    / float(build.data["cell"].num_nodes),
+                    "subgraph_context_cells": float(context_count),
+                    "subgraph_cell_fraction": float(training_data["cell"].num_nodes)
+                    / float(build.data["cell"].num_nodes),
+                    "subgraph_reverse_parity": 1.0,
+                    "global_positive_collision_count": float(collision_count),
+                }
+            )
+            for node_type in ("cell", "gene", "peak"):
+                count = float(training_data[node_type].num_nodes)
+                row[f"subgraph_{node_type}_nodes"] = count
+                row[f"subgraph_{node_type}_count"] = count
+            for relation, edge_type in STATE_RELATIONS.items():
+                reverse = (edge_type[2], f"rev_{edge_type[1]}", edge_type[0])
+                edge_count = float(training_data[edge_type].edge_index.shape[1])
+                row[f"subgraph_{relation}_edges"] = edge_count
+                row[f"subgraph_{relation}_edge_count"] = edge_count
+                row[f"subgraph_rev_{relation}_edges"] = float(
+                    training_data[reverse].edge_index.shape[1]
                 )
-                for node_type in ("cell", "gene", "peak"):
-                    row[f"subgraph_{node_type}_nodes"] = float(
-                        batch.data[node_type].num_nodes
-                    )
-                for relation, edge_type in STATE_RELATIONS.items():
-                    reverse = (edge_type[2], f"rev_{edge_type[1]}", edge_type[0])
-                    row[f"subgraph_{relation}_edges"] = float(
-                        batch.data[edge_type].edge_index.shape[1]
-                    )
-                    row[f"subgraph_rev_{relation}_edges"] = float(
-                        batch.data[reverse].edge_index.shape[1]
-                    )
             encoded_data = (
                 training_data
                 if device.type == "cpu"
@@ -620,32 +744,26 @@ def train_state(
                 ),
             )
             relation_losses: dict[str, torch.Tensor] = {}
-            sampled_cells = sample_cells_with_all_relations(
-                training_data,
-                tuple(STATE_RELATIONS.values()),
-                batch_size_cells,
-                generator,
-            )
-            row["sampled_cell_count"] = float(sampled_cells.numel())
             for relation, edge_type in STATE_RELATIONS.items():
                 src_type, dst_type, neg_key, temp_key = STATE_REL_CFG[relation]
-                relation_generator = relation_generators[relation]
-                edges_per_cell = int(
-                    train_cfg.get(
-                        f"positive_edges_per_cell_{relation}",
-                        train_cfg.get("positive_edges_per_cell", 4),
+                global_positive = sampled_payload[relation]["positive"]
+                weights = sampled_payload[relation]["weights"]
+                global_negatives = sampled_payload[relation]["negative"]
+                if batch is None:
+                    positive = global_positive
+                    negatives = global_negatives
+                else:
+                    positive = torch.stack(
+                        [
+                            batch.local_ids(src_type, global_positive[0]),
+                            batch.local_ids(dst_type, global_positive[1]),
+                        ]
                     )
-                )
-                positive, weights = sample_positive_edges_for_cells(
-                    training_data,
-                    edge_type,
-                    sampled_cells,
-                    edges_per_cell,
-                    relation_generator,
-                )
-                global_positive = _global_edge_index(
-                    positive, src_type, dst_type, global_node_ids
-                )
+                    negatives = batch.local_ids(dst_type, global_negatives)
+                    if bool((positive < 0).any()) or bool((negatives < 0).any()):
+                        raise RuntimeError(
+                            f"Local {relation} supervision mapping is incomplete."
+                        )
                 current_sources = set(map(int, global_positive[0].unique().tolist()))
                 sampled_sources[relation].update(current_sources)
                 row[f"{relation}_sampled_edges"] = float(positive.shape[1])
@@ -654,42 +772,20 @@ def train_state(
                 row[f"{relation}_cell_coverage"] = len(sampled_sources[relation]) / float(
                     build.data["cell"].num_nodes
                 )
-                all_local_positive = training_data[edge_type].edge_index
-                if relation in validation:
-                    if global_node_ids is None:
-                        all_local_positive = validation[relation]["full_positive"]
-                    else:
-                        mapped_validation = _map_global_edges_to_local_if_present(
-                            validation[relation]["positive"],
-                            global_node_ids,
-                            src_type,
-                            dst_type,
-                        )
-                        all_local_positive = torch.cat(
-                            [all_local_positive, mapped_validation], dim=1
-                        )
-                negatives = sample_negative_targets(
-                    positive,
-                    int(training_data[dst_type].num_nodes),
-                    int(train_cfg.get(neg_key, 5)),
-                    relation_generator,
-                    all_positive_edge_index=all_local_positive,
-                )
                 row[f"{relation}_negative_count"] = float(negatives.numel())
                 row[f"{relation}_positive_checksum"] = float(
                     _edge_checksum(global_positive)
                 )
-                negative_edges = torch.stack(
+                global_negative_edges = torch.stack(
                     [
-                        positive[0].repeat_interleave(negatives.shape[1]),
-                        negatives.reshape(-1),
+                        global_positive[0].repeat_interleave(
+                            global_negatives.shape[1]
+                        ),
+                        global_negatives.reshape(-1),
                     ]
                 )
-                global_negative = _global_edge_index(
-                    negative_edges, src_type, dst_type, global_node_ids
-                )
                 row[f"{relation}_negative_checksum"] = float(
-                    _edge_checksum(global_negative)
+                    _edge_checksum(global_negative_edges)
                 )
                 positive_device = positive.to(device)
                 negatives_device = negatives.to(device)
@@ -721,39 +817,13 @@ def train_state(
                 loss_config.lambda_cg * relation_losses["cg"]
                 + loss_config.lambda_cp * relation_losses["cp"]
             )
-            wnn_loss: torch.Tensor | None = None
-            if loss_config.lambda_wnn > 0:
-                if subgraph_sampler is None or global_node_ids is None:
-                    raise RuntimeError("WNN loss requires a sampled WNN batch.")
-                members = batch.diagnostics["context_member_ids"]
-                local_members = torch.searchsorted(
-                    global_node_ids["cell"], members
-                )
-                if not torch.equal(
-                    global_node_ids["cell"][local_members], members
-                ):
-                    raise RuntimeError("WNN members are absent from the sampled cell graph.")
-                wnn_loss = wnn_neighborhood_infonce_loss(
-                    embeddings["cell"],
-                    local_members[:, 0],
-                    local_members[:, 1:],
-                    batch.diagnostics["neighbor_weights"],
-                    num_negatives=int(train_cfg.get("negative_ratio_wnn", 5)),
-                    temperature=float(train_cfg.get("temperature_wnn", 0.2)),
-                    generator=wnn_generator,
-                )
-                row["wnn_loss"] = float(wnn_loss.detach())
-                row["loss_wnn"] = float(wnn_loss.detach())
-                row["wnn_negative_count"] = float(
-                    int(train_cfg.get("negative_ratio_wnn", 5))
-                )
             total_loss = stage1_objective(
                 relation_losses["cg"],
                 relation_losses["cp"],
                 lambda_graph=loss_config.weights.lambda_graph,
                 lambda_cg=loss_config.lambda_cg,
                 lambda_cp=loss_config.lambda_cp,
-                wnn_loss=wnn_loss,
+                wnn_loss=None,
                 lambda_wnn=loss_config.lambda_wnn,
                 normalize_relation_weights=False,
             )
@@ -777,6 +847,16 @@ def train_state(
                     "active_weight_lambda_cg": loss_config.lambda_cg,
                     "active_weight_lambda_cp": loss_config.lambda_cp,
                     "active_weight_lambda_wnn": loss_config.lambda_wnn,
+                    "cuda_peak_allocated_bytes": float(
+                        torch.cuda.max_memory_allocated(device)
+                        if device.type == "cuda"
+                        else 0
+                    ),
+                    "cuda_peak_reserved_bytes": float(
+                        torch.cuda.max_memory_reserved(device)
+                        if device.type == "cuda"
+                        else 0
+                    ),
                 }
             )
 
@@ -794,7 +874,7 @@ def train_state(
                     loss_config,
                     train_cfg,
                     device,
-                    subgraph_sampler,
+                    None,
                 )
                 row.update(validation_metrics)
             selection_value: float | None = None
@@ -847,22 +927,41 @@ def train_state(
 
     if best_state is None:
         raise RuntimeError("Stage-1 training produced no checkpoint.")
+    inference_device = _inference_device(
+        train_cfg.get(
+            "final_inference_device",
+            "cpu" if graph_batch_mode == "cell_feature_subgraph" else str(device),
+        )
+    )
+    del embeddings, encoded_data, encoded_features, relation_losses
+    del total_loss, graph_loss, positive_device, negatives_device
+    del pos_logits, neg_logits, relation_loss
+    model = model.to(inference_device)
     model.load_state_dict(best_state)
+    if device.type == "cuda" and inference_device.type == "cpu":
+        torch.cuda.empty_cache()
     model.eval()
     with torch.no_grad():
         inference_data = (
-            build.data if device.type == "cpu" else build.data.clone().to(device)
+            build.data
+            if inference_device.type == "cpu"
+            else build.data.clone().to(inference_device)
         )
         embeddings = {
             name: value.detach().cpu()
             for name, value in model.encode(
                 inference_data,
-                {name: value.to(device) for name, value in build.features.items()},
+                {
+                    name: value.to(inference_device)
+                    for name, value in build.features.items()
+                },
             ).items()
         }
     inference_diagnostics = {
         "final_inference_mode": "full_graph",
         "final_inference_batches": 1.0,
+        "final_inference_device": str(inference_device),
+        "training_graph_batch_mode": graph_batch_mode,
         "best_global_step": float(best_global_step),
         **{
             f"{node_type}_embedding_rows": float(values.shape[0])
