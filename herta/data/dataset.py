@@ -108,7 +108,11 @@ def load_toy_data(input_dir: str | Path) -> MultiomeData:
 
 
 def load_configured_multiome(config: dict) -> MultiomeData:
-    """Load a toy dataset or an aligned AnnData pair from HERTA config."""
+    """Load matrices only; this helper does not perform canonical preprocessing.
+
+    Formal HERTA runs must use :func:`prepare_multiome` and forward the returned
+    ``metadata["state_factors"]`` to ``build_state_graph``.
+    """
 
     data_cfg = config.get("data", {})
     if data_cfg.get("input_type", "anndata") == "toy":
@@ -415,8 +419,10 @@ def prepare_multiome(
     regulatory priors use HERTA-native equivalents of the corresponding
     scGLUE utilities. RNA PCA and ATAC LSI are fitted on all paired cells
     before the optional ``n_cells`` training subset is selected. Raw count matrices are retained in ``MultiomeData``;
-    processed AnnData objects and inspectable prior tables are returned in the
-    metadata dictionary. In canonical mode, ATAC peaks pass coordinate/support
+    processed AnnData objects, canonical ``state_factors``, and inspectable
+    prior tables are returned in the metadata dictionary. Downstream graph
+    construction must forward those factors and never refit them. In canonical
+    mode, ATAC peaks pass coordinate/support
     QC and a provisional LSI supplies the top variable peaks. Motif overlap and
     peak-gene distance never affect this peak-universe selection.
     """

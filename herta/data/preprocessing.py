@@ -213,7 +213,12 @@ def factorize_multiome(
     lsi_n_iter: int = 20,
     random_state: int = 0,
 ) -> MultiomeFactors:
-    """Return graph weights and GLUE-style RNA PCA / ATAC LSI factors."""
+    """Return graph weights and GLUE-style RNA PCA / ATAC LSI factors.
+
+    This is a low-level compatibility helper for isolated callers and tests.
+    The formal pipeline uses :func:`herta.data.dataset.prepare_multiome`, and
+    graph construction never invokes this function implicitly.
+    """
 
     rna_adata = AnnData(rna.copy() if hasattr(rna, "copy") else np.asarray(rna))
     preprocess_rna(

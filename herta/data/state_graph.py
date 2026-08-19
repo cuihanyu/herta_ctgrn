@@ -17,7 +17,7 @@ from herta.data.heterogeneous_graph import (
     QueryEdgeTensors,
     edge_tables_to_heterodata,
 )
-from herta.data.preprocessing import MultiomeFactors, factorize_multiome
+from herta.data.preprocessing import MultiomeFactors
 
 
 LOGGER = logging.getLogger(__name__)
@@ -79,16 +79,21 @@ def build_state_graph(
     top_cell_gene: int | None = 128,
     top_cell_peak: int | None = 256,
     gene_cell_quantile: float | None = 0.95,
-    n_hvg: int | None = 2000,
-    rna_hvg_flavor: str = "seurat_v3",
-    n_rna_components: int = 256,
-    n_atac_components: int = 256,
-    binarize_atac: bool = False,
-    drop_first_lsi: bool = True,
-    lsi_n_iter: int = 20,
-    random_state: int = 0,
 ) -> StateGraphBuildResult:
-    """Build Stage 1 through the canonical edge-table conversion path."""
+    """Build Stage 1 from canonically prepared data and factors.
+
+    Preprocessing is intentionally not available here.  Call
+    :func:`herta.data.dataset.prepare_multiome` once and pass its
+    ``metadata["state_factors"]`` result explicitly.
+    """
+
+    if factors is None:
+        raise ValueError(
+            "build_state_graph requires canonical MultiomeFactors; call "
+            "prepare_multiome(...) once and pass metadata['state_factors']."
+        )
+    if not isinstance(factors, MultiomeFactors):
+        raise TypeError("factors must be a MultiomeFactors instance.")
 
     if multiome.rna.shape[0] != multiome.atac.shape[0]:
         raise ValueError("RNA and ATAC matrices must have the same number of cells.")
@@ -100,32 +105,70 @@ def build_state_graph(
         np.asarray(multiome.peaks["retained_peak"], dtype=bool).all()
     ):
         raise ValueError("MultiomeData.peaks contains peaks not selected by the retained union.")
-    if factors is None:
-        factors = factorize_multiome(
-            multiome.rna,
-            multiome.atac,
-            n_rna_components=n_rna_components,
-            n_atac_components=n_atac_components,
-            n_hvg=n_hvg,
-            rna_hvg_flavor=rna_hvg_flavor,
-            binarize_atac=binarize_atac,
-            drop_first_lsi=drop_first_lsi,
-            lsi_n_iter=lsi_n_iter,
-            random_state=random_state,
-        )
-    expected = {
-        "rna_cell_scores": (multiome.rna.shape[0], None),
-        "rna_feature_loadings": (multiome.rna.shape[1], None),
-        "atac_cell_scores": (multiome.atac.shape[0], None),
-        "atac_feature_loadings": (multiome.atac.shape[1], None),
+    expected_matrices = {
+        "rna_norm": multiome.rna.shape,
+        "atac_tfidf": multiome.atac.shape,
     }
-    for name, (rows, _) in expected.items():
+    for name, expected_shape in expected_matrices.items():
+        value = getattr(factors, name)
+        if value.shape != expected_shape:
+            raise ValueError(
+                f"Precomputed {name} must have shape {expected_shape}; "
+                f"observed {value.shape}."
+            )
+        stored = value.data if sparse.issparse(value) else np.asarray(value)
+        if not np.isfinite(stored).all():
+            raise ValueError(f"Precomputed {name} contains NaN or infinite values.")
+    expected_factors = {
+        "rna_cell_scores": multiome.rna.shape[0],
+        "rna_feature_loadings": multiome.rna.shape[1],
+        "atac_cell_scores": multiome.atac.shape[0],
+        "atac_feature_loadings": multiome.atac.shape[1],
+    }
+    arrays: dict[str, np.ndarray] = {}
+    for name, rows in expected_factors.items():
         value = np.asarray(getattr(factors, name))
         if value.ndim != 2 or value.shape[0] != rows:
             raise ValueError(
                 f"Precomputed {name} must have shape ({rows}, n_components); "
                 f"observed {value.shape}."
             )
+        if value.shape[1] < 1:
+            raise ValueError(f"Precomputed {name} must contain at least one component.")
+        if not np.isfinite(value).all():
+            raise ValueError(f"Precomputed {name} contains NaN or infinite values.")
+        arrays[name] = value
+    if (
+        arrays["rna_cell_scores"].shape[1]
+        != arrays["rna_feature_loadings"].shape[1]
+    ):
+        raise ValueError("RNA cell scores and feature loadings must use the same components.")
+    if (
+        arrays["atac_cell_scores"].shape[1]
+        != arrays["atac_feature_loadings"].shape[1]
+    ):
+        raise ValueError("ATAC cell scores and feature loadings must use the same components.")
+    for name, expected_length in (
+        ("rna_highly_variable", multiome.rna.shape[1]),
+        ("atac_highly_variable", multiome.atac.shape[1]),
+    ):
+        value = getattr(factors, name)
+        if value is not None and np.asarray(value).shape != (expected_length,):
+            raise ValueError(f"Precomputed {name} must have length {expected_length}.")
+    if (
+        factors.atac_binary is not None
+        and factors.atac_binary.shape != multiome.atac.shape
+    ):
+        raise ValueError(
+            f"Precomputed atac_binary must have shape {multiome.atac.shape}; "
+            f"observed {factors.atac_binary.shape}."
+        )
+    if factors.atac_library_size is not None:
+        library_size = np.asarray(factors.atac_library_size)
+        if library_size.shape != (multiome.atac.shape[0],) or not np.isfinite(
+            library_size
+        ).all():
+            raise ValueError("Precomputed atac_library_size must be finite and cell-aligned.")
     gene_names = multiome.genes["gene"].astype(str).tolist()
     peak_names = multiome.peaks["peak"].astype(str).tolist()
     cell_names = list(multiome.cell_names or [f"cell_{i}" for i in range(multiome.rna.shape[0])])
@@ -134,12 +177,18 @@ def build_state_graph(
     features = {
         "cell": torch.from_numpy(
             np.ascontiguousarray(
-                np.concatenate([factors.rna_cell_scores, factors.atac_cell_scores], axis=1),
+                np.concatenate(
+                    [arrays["rna_cell_scores"], arrays["atac_cell_scores"]], axis=1
+                ),
                 dtype=np.float32,
             )
         ),
-        "gene": torch.from_numpy(np.ascontiguousarray(factors.rna_feature_loadings, dtype=np.float32)),
-        "peak": torch.from_numpy(np.ascontiguousarray(factors.atac_feature_loadings, dtype=np.float32)),
+        "gene": torch.from_numpy(
+            np.ascontiguousarray(arrays["rna_feature_loadings"], dtype=np.float32)
+        ),
+        "peak": torch.from_numpy(
+            np.ascontiguousarray(arrays["atac_feature_loadings"], dtype=np.float32)
+        ),
     }
     expression = sparse.csr_matrix(factors.rna_norm)
     # The prepared gene universe is HVG union eligible TF. Do not mask the
