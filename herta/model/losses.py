@@ -422,8 +422,8 @@ class Stage1LossConfig:
             lambda_anchor=0.0,
         )
     )
-    lambda_cg: float = 0.6
-    lambda_cp: float = 0.4
+    lambda_cg: float = 0.5
+    lambda_cp: float = 0.5
     lambda_wnn: float = 0.0
     normalize_relation_weights: bool = True
 
@@ -705,8 +705,8 @@ def stage1_objective(
     cg_loss: torch.Tensor,
     cp_loss: torch.Tensor,
     lambda_graph: float = 1.0,
-    lambda_cg: float = 0.6,
-    lambda_cp: float = 0.4,
+    lambda_cg: float = 0.5,
+    lambda_cp: float = 0.5,
     wnn_loss: torch.Tensor | None = None,
     lambda_wnn: float = 0.0,
     normalize_relation_weights: bool = True,

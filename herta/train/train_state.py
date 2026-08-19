@@ -11,7 +11,10 @@ import pandas as pd
 import torch
 
 from herta.data.negative_sampling import sample_negative_targets
-from herta.data.sampler import sample_positive_edges, sample_positive_edges_by_source
+from herta.data.sampler import (
+    sample_cells_with_all_relations,
+    sample_positive_edges_for_cells,
+)
 from herta.data.sampling import CellKNNSampler, SamplerConfig, SubgraphBatch
 from herta.data.state_graph import STATE_RELATIONS, StateGraphBuildResult
 from herta.model.losses import (
@@ -404,6 +407,15 @@ def train_state(
     loss_mapping = dict(train_cfg)
     loss_mapping.update(train_cfg.get("losses", {}))
     loss_config = Stage1LossConfig.from_mapping(loss_mapping)
+    if (
+        loss_config.weights.lambda_graph != 1.0
+        or loss_config.lambda_cg != 0.5
+        or loss_config.lambda_cp != 0.5
+        or loss_config.lambda_wnn != 0.0
+    ):
+        raise ValueError(
+            "The formal Stage-1 objective is fixed to 0.5*L_CG + 0.5*L_CP."
+        )
     modality_fusion = str(model_cfg.get("modality_fusion", "joint"))
     if modality_fusion not in {"joint", "concat"}:
         raise ValueError(
@@ -438,25 +450,20 @@ def train_state(
         )
         for offset, relation in enumerate(STATE_RELATIONS)
     }
-    sampling_strategy = str(train_cfg.get("sampling_strategy", "edge_uniform"))
-    if sampling_strategy not in {"edge_uniform", "cell_balanced", "wnn_subgraph"}:
+    sampling_strategy = str(train_cfg.get("sampling_strategy", "cell_balanced"))
+    if sampling_strategy != "cell_balanced":
         raise ValueError(
-            "state_training.sampling_strategy must be 'edge_uniform', "
-            "'cell_balanced', or 'wnn_subgraph'."
-        )
-    if loss_config.lambda_wnn > 0 and sampling_strategy != "wnn_subgraph":
-        raise ValueError(
-            "A positive lambda_wnn requires sampling_strategy='wnn_subgraph'."
+            "The formal Stage-1 baseline requires sampling_strategy='cell_balanced'."
         )
     checkpoint_selection = str(
         train_cfg.get(
             "checkpoint_selection",
-            "validation",
+            "loss",
         )
     )
-    if checkpoint_selection not in {"validation", "last", "loss"}:
+    if checkpoint_selection != "loss":
         raise ValueError(
-            "state_training.checkpoint_selection must be 'validation', 'last', or 'loss'."
+            "The formal Stage-1 baseline requires checkpoint_selection='loss'."
         )
     epochs = int(train_cfg.get("epochs", 100))
     # Omitted values retain the historical one-update epoch; maintained configs
@@ -472,37 +479,7 @@ def train_state(
         raise ValueError(
             "validation_interval_steps and early_stopping_patience must be positive."
         )
-    validation_generator = torch.Generator().manual_seed(base_seed + 4_001)
-    training_graph, validation = _split_fixed_validation_edges(
-        build.data,
-        validation_fraction=float(train_cfg.get("validation_fraction", 0.05)),
-        validation_cells=int(train_cfg.get("validation_cells", 64)),
-        max_edges_per_cell=int(
-            train_cfg.get("validation_positive_edges_per_cell", 4)
-        ),
-        generator=validation_generator,
-    )
-    validation = _fixed_validation_payload(
-        validation,
-        build.data,
-        train_cfg,
-        validation_generator,
-    )
-    if checkpoint_selection == "validation" and set(validation) != set(STATE_RELATIONS):
-        raise ValueError(
-            "checkpoint_selection='validation' requires non-empty fixed CG and CP "
-            "validation edges; increase validation_cells or validation_fraction."
-        )
-    if validation:
-        LOGGER.info(
-            "Stage1 fixed validation: cg_positive=%d cp_positive=%d "
-            "cg_negatives_per_positive=%d cp_negatives_per_positive=%d",
-            validation["cg"]["positive"].shape[1] if "cg" in validation else 0,
-            validation["cp"]["positive"].shape[1] if "cp" in validation else 0,
-            validation["cg"]["negative"].shape[1] if "cg" in validation else 0,
-            validation["cp"]["negative"].shape[1] if "cp" in validation else 0,
-        )
-    batch_size = int(train_cfg.get("batch_size_edges_per_relation", 256))
+    training_graph, validation = build.data, {}
     batch_size_cells = int(train_cfg.get("batch_size_cells", 1024))
     subgraph_sampler: CellKNNSampler | None = None
     subgraph_generator = torch.Generator().manual_seed(base_seed + 3_001)
@@ -628,33 +605,36 @@ def train_state(
                 ),
             )
             relation_losses: dict[str, torch.Tensor] = {}
+            sampled_cells = sample_cells_with_all_relations(
+                training_data,
+                tuple(STATE_RELATIONS.values()),
+                batch_size_cells,
+                generator,
+            )
+            row["sampled_cell_count"] = float(sampled_cells.numel())
             for relation, edge_type in STATE_RELATIONS.items():
                 src_type, dst_type, neg_key, temp_key = STATE_REL_CFG[relation]
                 relation_generator = relation_generators[relation]
-                if sampling_strategy in {"cell_balanced", "wnn_subgraph"}:
-                    edges_per_cell = int(
-                        train_cfg.get(
-                            f"positive_edges_per_cell_{relation}",
-                            train_cfg.get("positive_edges_per_cell", 4),
-                        )
+                edges_per_cell = int(
+                    train_cfg.get(
+                        f"positive_edges_per_cell_{relation}",
+                        train_cfg.get("positive_edges_per_cell", 4),
                     )
-                    positive, weights = sample_positive_edges_by_source(
-                        training_data,
-                        edge_type,
-                        batch_size_cells,
-                        edges_per_cell,
-                        relation_generator,
-                    )
-                else:
-                    positive, weights = sample_positive_edges(
-                        training_data, edge_type, batch_size, relation_generator
-                    )
+                )
+                positive, weights = sample_positive_edges_for_cells(
+                    training_data,
+                    edge_type,
+                    sampled_cells,
+                    edges_per_cell,
+                    relation_generator,
+                )
                 global_positive = _global_edge_index(
                     positive, src_type, dst_type, global_node_ids
                 )
                 current_sources = set(map(int, global_positive[0].unique().tolist()))
                 sampled_sources[relation].update(current_sources)
                 row[f"{relation}_sampled_edges"] = float(positive.shape[1])
+                row[f"{relation}_positive_count"] = float(positive.shape[1])
                 row[f"{relation}_sampled_cells"] = float(len(current_sources))
                 row[f"{relation}_cell_coverage"] = len(sampled_sources[relation]) / float(
                     build.data["cell"].num_nodes
@@ -680,7 +660,7 @@ def train_state(
                     relation_generator,
                     all_positive_edge_index=all_local_positive,
                 )
-                row[f"{relation}_negative_count"] = float(negatives.shape[1])
+                row[f"{relation}_negative_count"] = float(negatives.numel())
                 row[f"{relation}_positive_checksum"] = float(
                     _edge_checksum(global_positive)
                 )

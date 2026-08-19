@@ -65,3 +65,56 @@ def sample_positive_edges_by_source(
     ).long()
     indices = (starts[chosen, None] + offsets).reshape(-1)
     return edge_index[:, indices], weights[indices]
+
+
+def sample_cells_with_all_relations(
+    data: HeteroData,
+    edge_types: tuple[tuple[str, str, str], ...],
+    batch_size_cells: int,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Sample one shared cell batch with positives in every Stage-1 relation."""
+
+    if batch_size_cells < 1:
+        raise ValueError("batch_size_cells must be positive.")
+    eligible: torch.Tensor | None = None
+    n_cells = int(data["cell"].num_nodes)
+    for edge_type in edge_types:
+        sources = data[edge_type].edge_index[0]
+        present = torch.zeros(n_cells, dtype=torch.bool)
+        present[sources.unique()] = True
+        eligible = present if eligible is None else eligible & present
+    assert eligible is not None
+    candidates = torch.nonzero(eligible, as_tuple=False).flatten()
+    if candidates.numel() == 0:
+        raise ValueError("No cells have observed positives in every Stage-1 relation.")
+    order = torch.randperm(candidates.numel(), generator=generator)
+    return candidates[order[: min(batch_size_cells, candidates.numel())]]
+
+
+def sample_positive_edges_for_cells(
+    data: HeteroData,
+    edge_type: tuple[str, str, str],
+    cell_ids: torch.Tensor,
+    edges_per_cell: int,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample relation positives for an explicit shared batch of cell IDs."""
+
+    if edges_per_cell < 1:
+        raise ValueError("edges_per_cell must be positive.")
+    edge_index = data[edge_type].edge_index
+    weights = data[edge_type].edge_weight
+    sources = edge_index[0]
+    if sources.numel() > 1 and not bool(torch.all(sources[1:] >= sources[:-1])):
+        raise ValueError("Cell-balanced sampling requires source-grouped edges.")
+    counts = torch.bincount(sources, minlength=int(data["cell"].num_nodes))
+    if bool((counts[cell_ids] == 0).any()):
+        raise ValueError(f"Some sampled cells have no positives for {edge_type}.")
+    starts = torch.cumsum(counts, dim=0) - counts
+    offsets = (
+        torch.rand((cell_ids.numel(), edges_per_cell), generator=generator)
+        * counts[cell_ids, None]
+    ).long()
+    indices = (starts[cell_ids, None] + offsets).reshape(-1)
+    return edge_index[:, indices], weights[indices]
